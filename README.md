@@ -32,6 +32,10 @@ Best part? it does everything locally.
 
 ---
 
+### Demo:
+https://github.com/user-attachments/assets/3778d3f5-c338-4298-a296-e29dbfb27227
+
+---
 ## What is ReCall?
 
 ReCall watches your footage for you and makes it searchable.
