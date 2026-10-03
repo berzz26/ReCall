@@ -2,6 +2,8 @@
 
 run:
 	go run ./services/api/cmd/server
+run-web:
+	cd services/web && npm run dev
 
 build:
 	go build -o bin/api ./services/api/cmd/server
