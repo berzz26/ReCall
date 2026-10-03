@@ -1,7 +1,12 @@
-.PHONY: run build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install
+.PHONY: run build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install codec-experiment
 
 run:
 	go run ./services/api/cmd/server
+
+# TEMPORARY: standalone CodecSight signal inspection. Usage:
+#   make codec-experiment INPUT=/path/to/video.mp4
+codec-experiment:
+	go run ./services/api/cmd/codec-experiment -input "$(INPUT)"
 run-web:
 	cd services/web && npm run dev
 

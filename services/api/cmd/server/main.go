@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/berzz26/recall/pkg/database"
+	"github.com/berzz26/recall/services/api/internal/codec_experiment"
 	"github.com/berzz26/recall/services/api/internal/config"
 	"github.com/berzz26/recall/services/api/internal/detection"
 	"github.com/berzz26/recall/services/api/internal/detector"
@@ -27,8 +28,8 @@ import (
 	"github.com/berzz26/recall/services/api/internal/video_event"
 	"github.com/berzz26/recall/services/api/internal/video_frame"
 	"github.com/berzz26/recall/services/api/internal/video_media"
-	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_processing_checkpoint"
+	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_track"
 	"github.com/berzz26/recall/services/api/internal/vision"
 	"github.com/berzz26/recall/services/api/internal/visual"
@@ -181,7 +182,23 @@ func main() {
 	}
 
 	checkpointRepo := video_processing_checkpoint.NewRepository(db.DB)
-	processor := processing.NewFFprobeProcessorWithCheckpoints(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo)
+
+	// TEMPORARY EXPERIMENT: codec-level signal inspection. Left nil unless
+	// CODEC_EXPERIMENT_ENABLED is set, which keeps the pipeline unchanged.
+	var codecExperiment *codec_experiment.Service
+	if cfg.CodecExperimentEnabled {
+		codecExperiment = codec_experiment.NewService(cfg.FFprobePath, cfg.CodecExperimentPython,
+			cfg.CodecExperimentScript, cfg.CodecExperimentOutDir, cfg.CodecExperimentMaxFrames,
+			cfg.CodecExperimentTimeout)
+		slog.Info("codec experiment ENABLED (temporary) — artifacts will be written under "+cfg.CodecExperimentOutDir,
+			"python", cfg.CodecExperimentPython, "script", cfg.CodecExperimentScript,
+			"max_frames", cfg.CodecExperimentMaxFrames, "timeout", cfg.CodecExperimentTimeout)
+		if _, err := exec.LookPath(cfg.CodecExperimentPython); err != nil {
+			slog.Warn("codec experiment: python not found, motion vectors will be unavailable (ffprobe fallback)", "path", cfg.CodecExperimentPython, "error", err)
+		}
+	}
+
+	processor := processing.NewFFprobeProcessorWithCodecExperiment(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo, codecExperiment)
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)
@@ -201,10 +218,10 @@ func main() {
 
 	app.Use(recover.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "*",
+		AllowOrigins:  "*",
+		AllowHeaders:  "*",
 		ExposeHeaders: "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
 	if cfg.Env == "development" {
 		app.Use(logger.New(logger.Config{

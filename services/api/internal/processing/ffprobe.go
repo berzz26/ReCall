@@ -9,16 +9,17 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/codec_experiment"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
 	"github.com/berzz26/recall/services/api/internal/storage"
-	"github.com/berzz26/recall/services/api/internal/vision"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/berzz26/recall/services/api/internal/video_event"
 	"github.com/berzz26/recall/services/api/internal/video_frame"
@@ -26,6 +27,7 @@ import (
 	"github.com/berzz26/recall/services/api/internal/video_processing_checkpoint"
 	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_track"
+	"github.com/berzz26/recall/services/api/internal/vision"
 	"github.com/berzz26/recall/services/api/internal/visual"
 )
 
@@ -42,6 +44,9 @@ type FFprobeProcessor struct {
 	descService    *segment_description.Service
 	embedService   *segment_embedding.Service
 	checkpointRepo *video_processing_checkpoint.Repository
+	// TEMPORARY EXPERIMENT: nil unless CODEC_EXPERIMENT_ENABLED is set. Reads codec
+	// signals from the source stream only; never alters pipeline behaviour.
+	codecExperiment *codec_experiment.Service
 }
 
 func NewFFprobeProcessor(ffprobePath string, timeout time.Duration, store storage.Storage, mediaService *video_media.Service) *FFprobeProcessor {
@@ -119,6 +124,14 @@ func NewFFprobeProcessorWithEmbeddings(ffprobePath string, timeout time.Duration
 func NewFFprobeProcessorWithCheckpoints(ffprobePath string, timeout time.Duration, store storage.Storage, mediaService *video_media.Service, segmentService *video_segment.Service, frameService *video_frame.Service, visualService *visual.Service, trackService *video_track.Service, eventService *video_event.Service, descService *segment_description.Service, embedService *segment_embedding.Service, checkpointRepo *video_processing_checkpoint.Repository) *FFprobeProcessor {
 	p := NewFFprobeProcessorWithEmbeddings(ffprobePath, timeout, store, mediaService, segmentService, frameService, visualService, trackService, eventService, descService, embedService)
 	p.checkpointRepo = checkpointRepo
+	return p
+}
+
+// NewFFprobeProcessorWithCodecExperiment is TEMPORARY experiment wiring. Pass a
+// nil experiment to keep the original pipeline exactly as it was.
+func NewFFprobeProcessorWithCodecExperiment(ffprobePath string, timeout time.Duration, store storage.Storage, mediaService *video_media.Service, segmentService *video_segment.Service, frameService *video_frame.Service, visualService *visual.Service, trackService *video_track.Service, eventService *video_event.Service, descService *segment_description.Service, embedService *segment_embedding.Service, checkpointRepo *video_processing_checkpoint.Repository, experiment *codec_experiment.Service) *FFprobeProcessor {
+	p := NewFFprobeProcessorWithCheckpoints(ffprobePath, timeout, store, mediaService, segmentService, frameService, visualService, trackService, eventService, descService, embedService, checkpointRepo)
+	p.codecExperiment = experiment
 	return p
 }
 
@@ -363,6 +376,29 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 	}
 	mediaMs = time.Since(mediaStart).Milliseconds()
 	slog.Info("pipeline: media persisted", "video_id", v.ID.String(), "duration_ms", mediaMs)
+
+	// ---------------------------------------------------------------------------
+	// TEMPORARY EXPERIMENT (inert unless CODEC_EXPERIMENT_ENABLED is set).
+	// Placed here on purpose: this is the last point at which ReCall still holds
+	// the original coded stream. frameService.GenerateForVideo below re-encodes
+	// sampled frames to intra-only MJPEG, which discards picture types, motion
+	// vectors and residual structure permanently. Read-only, failure is logged
+	// and never propagated, so default behaviour is unchanged.
+	// ---------------------------------------------------------------------------
+	if p.codecExperiment != nil {
+		expStart := time.Now()
+		if res, expErr := p.codecExperiment.Run(ctx, videoPath, v.ID.String()); expErr != nil {
+			slog.Warn("codec experiment: failed (ignored)",
+				"video_id", v.ID.String(), "duration_ms", time.Since(expStart).Milliseconds(), "error", expErr)
+		} else {
+			// Report goes to stderr so the server's stdout slog stream stays JSON-parseable.
+			fmt.Fprintln(os.Stderr, res.Report)
+			slog.Info("codec experiment: report printed",
+				"video_id", v.ID.String(), "extractor", res.Extractor,
+				"out_dir", filepath.Dir(res.JSONPath))
+		}
+	}
+	// ---------------------------------------------------------------------------
 
 	var segments []video_segment.VideoSegment
 	if p.segmentService != nil {

@@ -62,6 +62,14 @@ type Config struct {
 	TrackerTrackBuffer     int
 	TrackerFuseScore       bool
 	TrackerMinHits         int
+
+	// TEMPORARY EXPERIMENT (codec_experiment). Nil service unless enabled.
+	CodecExperimentEnabled   bool
+	CodecExperimentOutDir    string
+	CodecExperimentPython    string
+	CodecExperimentScript    string
+	CodecExperimentMaxFrames int
+	CodecExperimentTimeout   time.Duration
 }
 
 func Load() Config {
@@ -503,6 +511,53 @@ func Load() Config {
 		panic(fmt.Sprintf("invalid TRACKER_MIN_HITS %d: must be >= 1", trackerMinHits))
 	}
 
+	// TEMPORARY EXPERIMENT: codec-level signal inspection. Default off so that
+	// existing behaviour is unchanged.
+	codecExperimentEnabled := false
+	if v := os.Getenv("CODEC_EXPERIMENT_ENABLED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			codecExperimentEnabled = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			codecExperimentEnabled = false
+		default:
+			panic(fmt.Sprintf("invalid CODEC_EXPERIMENT_ENABLED %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	codecExperimentOutDir := os.Getenv("CODEC_EXPERIMENT_OUT_DIR")
+	if codecExperimentOutDir == "" {
+		codecExperimentOutDir = "./codec_experiment"
+	}
+
+	codecExperimentPython := os.Getenv("CODEC_EXPERIMENT_PYTHON")
+	if codecExperimentPython == "" {
+		codecExperimentPython = pythonPath
+	}
+
+	codecExperimentScript := os.Getenv("CODEC_EXPERIMENT_SCRIPT")
+	if codecExperimentScript == "" {
+		codecExperimentScript = filepath.Join("workers", "codec_experiment", "mvdump.py")
+	}
+
+	codecExperimentMaxFrames := 0
+	if v := os.Getenv("CODEC_EXPERIMENT_MAX_FRAMES"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid CODEC_EXPERIMENT_MAX_FRAMES %q: must be an integer >= 0 (0 = no limit)", v))
+		}
+		codecExperimentMaxFrames = parsed
+	}
+
+	codecExperimentTimeout := 10 * time.Minute
+	if v := os.Getenv("CODEC_EXPERIMENT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			panic(fmt.Sprintf("invalid CODEC_EXPERIMENT_TIMEOUT %q: must be a positive duration", v))
+		}
+		codecExperimentTimeout = d
+	}
+
 	return Config{
 		Env:                    env,
 		Port:                   port,
@@ -554,5 +609,12 @@ func Load() Config {
 		TrackerTrackBuffer:     trackerTrackBuffer,
 		TrackerFuseScore:       trackerFuseScore,
 		TrackerMinHits:         trackerMinHits,
+
+		CodecExperimentEnabled:   codecExperimentEnabled,
+		CodecExperimentOutDir:    codecExperimentOutDir,
+		CodecExperimentPython:    codecExperimentPython,
+		CodecExperimentScript:    codecExperimentScript,
+		CodecExperimentMaxFrames: codecExperimentMaxFrames,
+		CodecExperimentTimeout:   codecExperimentTimeout,
 	}
 }
