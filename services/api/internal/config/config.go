@@ -26,6 +26,15 @@ type Config struct {
 	SegmentDuration        time.Duration
 	FrameSampleInterval    time.Duration
 	SamplerBeta            float64
+	SamplerAdaptive        bool
+	ProbeFPS               float64
+	ProbeSize              int
+	ProbeGrid              int
+	ProbeNoiseK            float64
+	CoarseInterval         time.Duration
+	CoarseMaxGap           time.Duration
+	CoarseFKeep            float64
+	SamplerPlanTimeout     time.Duration
 	FFmpegPath             string
 	FFmpegTimeout          time.Duration
 	FrameJPEGQuality       int
@@ -163,6 +172,102 @@ func Load() Config {
 			panic(fmt.Sprintf("SAMPLER_BETA must be > 0, got %s", v))
 		}
 		samplerBeta = parsed
+	}
+
+	// Phase 2 adaptive coarse sampler: visual probe (5 FPS, 64x64 gray, 8x8
+	// grid) driving coarse/heartbeat selection within the baseline budget.
+	// SAMPLER_ADAPTIVE=false restores the fixed 2-second baseline plan.
+	samplerAdaptive := true
+	if v := os.Getenv("SAMPLER_ADAPTIVE"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			samplerAdaptive = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			samplerAdaptive = false
+		default:
+			panic(fmt.Sprintf("invalid SAMPLER_ADAPTIVE %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	probeFPS := 5.0
+	if v := os.Getenv("PROBE_FPS"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_FPS %q: must be > 0", v))
+		}
+		probeFPS = parsed
+	}
+
+	probeSize := 64
+	if v := os.Getenv("PROBE_SIZE"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_SIZE %q: must be > 0", v))
+		}
+		probeSize = parsed
+	}
+
+	probeGrid := 8
+	if v := os.Getenv("PROBE_GRID"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_GRID %q: must be > 0", v))
+		}
+		probeGrid = parsed
+	}
+	if probeSize%probeGrid != 0 {
+		panic(fmt.Sprintf("PROBE_SIZE (%d) must be divisible by PROBE_GRID (%d)", probeSize, probeGrid))
+	}
+
+	probeNoiseK := 3.0
+	if v := os.Getenv("PROBE_NOISE_K"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid PROBE_NOISE_K %q: must be >= 0", v))
+		}
+		probeNoiseK = parsed
+	}
+
+	coarseInterval := 4 * time.Second
+	if v := os.Getenv("COARSE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("COARSE_INTERVAL must be > 0, got %s", v))
+			}
+			coarseInterval = d
+		} else {
+			panic(fmt.Sprintf("invalid COARSE_INTERVAL %q: %v", v, err))
+		}
+	}
+
+	coarseMaxGap := 10 * time.Second
+	if v := os.Getenv("COARSE_MAX_GAP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("COARSE_MAX_GAP must be > 0, got %s", v))
+			}
+			coarseMaxGap = d
+		} else {
+			panic(fmt.Sprintf("invalid COARSE_MAX_GAP %q: %v", v, err))
+		}
+	}
+
+	coarseFKeep := 0.25
+	if v := os.Getenv("COARSE_F_KEEP"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 || parsed > 1 {
+			panic(fmt.Sprintf("invalid COARSE_F_KEEP %q: must be 0..1", v))
+		}
+		coarseFKeep = parsed
+	}
+
+	samplerPlanTimeout := 5 * time.Minute
+	if v := os.Getenv("SAMPLER_PLAN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			samplerPlanTimeout = d
+		} else {
+			panic(fmt.Sprintf("invalid SAMPLER_PLAN_TIMEOUT %q", v))
+		}
 	}
 
 	ffmpegTimeout := 60 * time.Second
@@ -533,6 +638,15 @@ func Load() Config {
 		SegmentDuration:        segmentDuration,
 		FrameSampleInterval:    frameSampleInterval,
 		SamplerBeta:            samplerBeta,
+		SamplerAdaptive:        samplerAdaptive,
+		ProbeFPS:               probeFPS,
+		ProbeSize:              probeSize,
+		ProbeGrid:              probeGrid,
+		ProbeNoiseK:            probeNoiseK,
+		CoarseInterval:         coarseInterval,
+		CoarseMaxGap:           coarseMaxGap,
+		CoarseFKeep:            coarseFKeep,
+		SamplerPlanTimeout:     samplerPlanTimeout,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,

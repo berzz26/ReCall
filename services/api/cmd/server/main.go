@@ -18,6 +18,7 @@ import (
 	"github.com/berzz26/recall/services/api/internal/health"
 	local_source "github.com/berzz26/recall/services/api/internal/local_source"
 	"github.com/berzz26/recall/services/api/internal/processing"
+	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/search"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
@@ -27,8 +28,8 @@ import (
 	"github.com/berzz26/recall/services/api/internal/video_event"
 	"github.com/berzz26/recall/services/api/internal/video_frame"
 	"github.com/berzz26/recall/services/api/internal/video_media"
-	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_processing_checkpoint"
+	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_track"
 	"github.com/berzz26/recall/services/api/internal/vision"
 	"github.com/berzz26/recall/services/api/internal/visual"
@@ -72,6 +73,29 @@ func main() {
 	videoFrameRepo := video_frame.NewRepository(db.DB)
 	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality).WithSamplerBeta(cfg.SamplerBeta)
 	slog.Info("frame sampler configured", "sample_interval", cfg.FrameSampleInterval.String(), "sampler_beta", cfg.SamplerBeta)
+	if cfg.SamplerAdaptive {
+		adaptiveCfg := sampler.AdaptiveConfig{
+			BaselineInterval: cfg.FrameSampleInterval,
+			Beta:             cfg.SamplerBeta,
+			ProbeFPS:         cfg.ProbeFPS,
+			ProbeSize:        cfg.ProbeSize,
+			ProbeGrid:        cfg.ProbeGrid,
+			NoiseK:           cfg.ProbeNoiseK,
+			CoarseInterval:   cfg.CoarseInterval,
+			MaxGap:           cfg.CoarseMaxGap,
+			FKeep:            cfg.CoarseFKeep,
+			FFmpegPath:       cfg.FFmpegPath,
+			PlanTimeout:      cfg.SamplerPlanTimeout,
+		}
+		videoFrameService.WithVideoPlanner(sampler.NewAdaptiveCoarsePlanner(adaptiveCfg))
+		slog.Info("adaptive coarse sampler enabled",
+			"probe_fps", cfg.ProbeFPS, "probe_size", cfg.ProbeSize, "probe_grid", cfg.ProbeGrid,
+			"noise_k", cfg.ProbeNoiseK, "f_keep", cfg.CoarseFKeep,
+			"g", cfg.CoarseInterval.String(), "max_gap", cfg.CoarseMaxGap.String(),
+			"plan_timeout", cfg.SamplerPlanTimeout.String())
+	} else {
+		slog.Info("adaptive sampler disabled via SAMPLER_ADAPTIVE=false; using fixed baseline plan")
+	}
 
 	detectionRepo := detection.NewRepository(db.DB)
 	scriptPath := filepath.Join("workers", "detector", "detect.py")
@@ -202,10 +226,10 @@ func main() {
 
 	app.Use(recover.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "*",
+		AllowOrigins:  "*",
+		AllowHeaders:  "*",
 		ExposeHeaders: "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
 	if cfg.Env == "development" {
 		app.Use(logger.New(logger.Config{

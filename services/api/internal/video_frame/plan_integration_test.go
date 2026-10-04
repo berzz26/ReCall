@@ -106,3 +106,75 @@ func TestIntegrationBaselineParity(t *testing.T) {
 		}
 	}
 }
+
+// TestIntegrationAdaptiveCoarse exercises the Phase 2 path end to end on a
+// real fixture: video -> visual probe -> adaptive planner ->
+// GenerateForVideoWithPlan (real ffmpeg extraction, in-memory persistence).
+// Downstream shape and behavior are unchanged; only the timestamp plan is
+// adaptive.
+func TestIntegrationAdaptiveCoarse(t *testing.T) {
+	const duration = 110.94 // ffprobe duration of video1.mp4
+	svc, _, store, v, _ := newIntegrationFixture(t, duration)
+	ctx := context.Background()
+
+	// Segments covering the whole video (30s like the pipeline default).
+	var segs []video_segment.VideoSegment
+	start := 0.0
+	for i := 0; start < duration-1e-9; i++ {
+		end := start + 30.0
+		if end > duration {
+			end = duration
+		}
+		segs = append(segs, video_segment.VideoSegment{
+			ID: uuid.New(), VideoID: v.ID, SegmentIndex: i,
+			StartTime: start, EndTime: end, Duration: end - start,
+		})
+		start = end
+	}
+
+	planner := sampler.NewAdaptiveCoarsePlanner(sampler.DefaultAdaptiveConfig())
+	svc.WithVideoPlanner(planner)
+
+	frames, err := svc.GenerateForVideo(ctx, v, segs, duration, 1270, 720)
+	if err != nil {
+		t.Fatalf("GenerateForVideo (adaptive): %v", err)
+	}
+	if len(frames) == 0 {
+		t.Fatalf("adaptive plan produced no frames")
+	}
+
+	budget, err := sampler.BaselineBudget(duration, 2*time.Second, 1.0)
+	if err != nil {
+		t.Fatalf("budget: %v", err)
+	}
+	if len(frames) > budget.Cap {
+		t.Fatalf("adaptive selected %d frames, budget cap %d", len(frames), budget.Cap)
+	}
+	t.Logf("adaptive: %d frames vs baseline budget %d (saved ~%d)",
+		len(frames), budget.BaselineCount, budget.BaselineCount-len(frames))
+
+	seen := map[float64]bool{}
+	for i, f := range frames {
+		ts := f.TimestampSeconds
+		if ts < 0 || ts >= duration {
+			t.Fatalf("frame %d ts %v out of range", i, ts)
+		}
+		if i > 0 && ts <= frames[i-1].TimestampSeconds {
+			t.Fatalf("frames not strictly sorted at %d", i)
+		}
+		if seen[ts] {
+			t.Fatalf("duplicate ts %v", ts)
+		}
+		seen[ts] = true
+		// VideoFrame shape unchanged for downstream consumers.
+		if f.VideoID != v.ID || f.SegmentID == uuid.Nil || f.FrameIndex != i {
+			t.Fatalf("frame %d identity broken: %+v", i, f)
+		}
+		if f.Width <= 0 || f.Height <= 0 {
+			t.Fatalf("frame %d invalid dims", i)
+		}
+		if ok, _ := store.Exists(ctx, f.StorageKey); !ok {
+			t.Fatalf("frame %d file missing", i)
+		}
+	}
+}

@@ -56,6 +56,10 @@ type Service struct {
 	// extractOne performs single-timestamp decoding. Defaults to
 	// extractSingleFrame (ffmpeg seeking); tests override it.
 	extractOne extractFunc
+	// videoPlanner, when set, replaces the fixed 2-second baseline grid
+	// with an adaptive plan (e.g. the visual-probe coarse planner). The
+	// extractor still only consumes the resulting timestamp list.
+	videoPlanner sampler.VideoPlanner
 }
 
 func NewService(repo *Repository, store storage.Storage, sampleInterval time.Duration, ffmpegPath string, ffmpegTimeout time.Duration, jpegQuality int) *Service {
@@ -127,11 +131,36 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// WithVideoPlanner installs an adaptive planner consulted by
+// GenerateForVideo before extraction. Nil (default) preserves the Phase 1
+// fixed 2-second baseline behavior.
+func (s *Service) WithVideoPlanner(p sampler.VideoPlanner) *Service {
+	s.videoPlanner = p
+	return s
+}
+
 // GenerateForVideo is the legacy entry point. It now builds an explicit
 // baseline sampling plan (fixed 2-second grid, budget-capped) and delegates
 // to GenerateForVideoWithPlan, so effective frames are unchanged while the
 // planner/extractor separation is in force.
 func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, durationSeconds float64, width, height int) ([]VideoFrame, error) {
+	if s.videoPlanner != nil {
+		// Adaptive path: plan from the concrete video file, then extract
+		// exactly the planned timestamps. The planner falls back to the
+		// baseline grid internally on any probe failure.
+		videoPath, cleanup, err := s.resolveVideoPath(ctx, v)
+		if err != nil {
+			return nil, err
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		res, err := s.videoPlanner.PlanVideo(ctx, v.ID, videoPath, durationSeconds)
+		if err != nil {
+			return nil, err
+		}
+		return s.GenerateForVideoWithPlan(ctx, v, segments, res.Plan, width, height)
+	}
 	planner := sampler.NewBaselinePlanner(s.sampleInterval, s.samplerBeta)
 	plan, err := planner.Plan(v.ID, durationSeconds)
 	if err != nil {
