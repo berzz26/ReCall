@@ -185,20 +185,59 @@ func main() {
 
 	// TEMPORARY EXPERIMENT: codec-level signal inspection. Left nil unless
 	// CODEC_EXPERIMENT_ENABLED is set, which keeps the pipeline unchanged.
+	// Dynamic sampling needs the same analyzer; when dynamic sampling is on,
+	// analysis runs inside frame extraction, so the separate read-only hook is
+	// disabled to avoid decoding and reporting the same video twice.
 	var codecExperiment *codec_experiment.Service
-	if cfg.CodecExperimentEnabled {
+	var processorExperiment *codec_experiment.Service
+	var dynamicSampler *codec_experiment.DynamicSampler
+	if cfg.CodecExperimentEnabled || cfg.DynamicSamplingEnabled {
 		codecExperiment = codec_experiment.NewService(cfg.FFprobePath, cfg.CodecExperimentPython,
 			cfg.CodecExperimentScript, cfg.CodecExperimentOutDir, cfg.CodecExperimentMaxFrames,
 			cfg.CodecExperimentTimeout)
-		slog.Info("codec experiment ENABLED (temporary) — artifacts will be written under "+cfg.CodecExperimentOutDir,
+		slog.Info("codec experiment analyzer available (temporary) — artifacts will be written under "+cfg.CodecExperimentOutDir,
 			"python", cfg.CodecExperimentPython, "script", cfg.CodecExperimentScript,
 			"max_frames", cfg.CodecExperimentMaxFrames, "timeout", cfg.CodecExperimentTimeout)
 		if _, err := exec.LookPath(cfg.CodecExperimentPython); err != nil {
 			slog.Warn("codec experiment: python not found, motion vectors will be unavailable (ffprobe fallback)", "path", cfg.CodecExperimentPython, "error", err)
 		}
 	}
+	if cfg.CodecExperimentEnabled && !cfg.DynamicSamplingEnabled {
+		processorExperiment = codecExperiment
+	}
+	if cfg.DynamicSamplingEnabled {
+		dynamicCfg := codec_experiment.DynamicConfig{
+			Enabled:          true,
+			BaselineInterval: cfg.FrameSampleInterval,
+			DenseInterval:    cfg.DynamicDenseInterval,
+			WindowBefore:     cfg.DynamicWindowBefore,
+			WindowAfter:      cfg.DynamicWindowAfter,
+			WeightMean:       cfg.DynamicWeightMean,
+			WeightMax:        cfg.DynamicWeightMax,
+			WeightStatic:     cfg.DynamicWeightStatic,
+			WeightPacket:     cfg.DynamicWeightPacket,
+			EnterThreshold:   cfg.DynamicEnterThreshold,
+			ExitThreshold:    cfg.DynamicExitThreshold,
+			MergeGap:         cfg.DynamicMergeGap,
+			LowPercentile:    cfg.DynamicLowPercentile,
+			HighPercentile:   cfg.DynamicHighPercentile,
+		}
+		if err := codec_experiment.ValidateDynamicConfig(dynamicCfg, cfg.FrameSampleInterval); err != nil {
+			slog.Error("dynamic codec sampling misconfigured", "error", err)
+			os.Exit(1)
+		}
+		dynamicSampler = codec_experiment.NewDynamicSampler(codecExperiment, dynamicCfg)
+		videoFrameService = video_frame.NewServiceWithDynamicSampler(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality, dynamicSampler)
+		slog.Info("dynamic codec sampling ENABLED (temporary experiment) — baseline interval unchanged, dense sampling only inside codec activity regions",
+			"baseline_interval", cfg.FrameSampleInterval,
+			"dense_interval", cfg.DynamicDenseInterval,
+			"window_before", cfg.DynamicWindowBefore,
+			"window_after", cfg.DynamicWindowAfter,
+			"enter_threshold", cfg.DynamicEnterThreshold,
+			"exit_threshold", cfg.DynamicExitThreshold)
+	}
 
-	processor := processing.NewFFprobeProcessorWithCodecExperiment(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo, codecExperiment)
+	processor := processing.NewFFprobeProcessorWithCodecExperiment(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo, processorExperiment)
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)

@@ -339,3 +339,55 @@ policy, and no inference behaviour was changed.
   checkout (that package does not load `.env`, so it cannot reach Postgres; the
   server does load it and connects fine). Pre-existing and unrelated.
 
+---
+
+## 9. Iteration 2 — dynamic codec-activity sampling (throwaway)
+
+Opt-in via `CODECSIGHT_DYNAMIC_SAMPLING=true` (default `false`). When off, frame
+extraction is the existing fixed-interval sampler, untouched. When on, the codec
+analysis above produces an activity score per coded picture; pictures above the
+enter threshold open a dense window (±1 s context, merged within a 1 s gap);
+inside windows the existing single-process `fps` stream runs at the dense
+interval (default 0.2 s) and only planned timestamps are retained. Dense outputs
+are a subset of one deterministic grid, so the final sequence is sorted,
+deduplicated, and chronological, and downstream stages see the same
+`VideoFrame` representation.
+
+Terminology used throughout: **high-activity frames / codec activity
+candidates**. Never "high-value frames". The codec marks where encoded motion
+changed; YOLO/VLM decide what it means.
+
+Activity score (experimental weights, explicitly not optimal):
+
+```
+score = 0.40 * norm(motion mean) + 0.20 * norm(motion max)
+      + 0.25 * (1 - norm(zero ratio)) + 0.15 * norm(packet bytes)
+```
+
+Normalization is percentile-based (p5–p95) for magnitudes and packet size, so a
+few extreme values cannot dominate a video. Raw motion-vector count is excluded
+on purpose: static content emits thousands of zero-displacement vectors. Enter
+0.90 / exit 0.70 hysteresis prevents flapping; the first threshold pair tried
+(0.55/0.35) marked a whole 12 s clip dense and was rejected for that reason.
+
+Residuals remain unattempted, as before.
+
+Measured, same two clips (`make codec-experiment INPUT=... ARGS="-dynamic"`):
+
+| clip | baseline | dynamic | added | ratio | regions |
+|---|---|---|---|---|---|
+| video2 (12 s) | 6 | 29 | 23 | 4.8× | 1.1–3.1 s, 4.4–7.2 s |
+| video1 (111 s) | 56 | 168 | 112 | 3.0× | 7 regions |
+
+Without PyAV the planner degrades to `baseline_fallback` with a recorded
+reason — it never fails the pipeline, and frame output is then identical to
+baseline. With motion available, the 4–5 s region the human ground truth
+describes (man opens car door) falls inside the 4.4–7.2 s dense window on
+video2. Whether those added frames are *semantically* better is still
+unevaluated, by design.
+
+Artifacts per video gain `<name>_dynamic.json` (config, summary, regions, exact
+baseline/selected/added timestamps, per-picture scores) and
+`<name>_dynamic.png` (activity with enter/exit lines, baseline grid, dynamic
+samples over shaded regions, region peaks).
+

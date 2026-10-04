@@ -5,8 +5,9 @@ run:
 
 # TEMPORARY: standalone CodecSight signal inspection. Usage:
 #   make codec-experiment INPUT=/path/to/video.mp4
+#   make codec-experiment INPUT=/path/to/video.mp4 ARGS="-dynamic"
 codec-experiment:
-	go run ./services/api/cmd/codec-experiment -input "$(INPUT)"
+	go run ./services/api/cmd/codec-experiment -input "$(INPUT)" $(ARGS)
 run-web:
 	cd services/web && npm run dev
 

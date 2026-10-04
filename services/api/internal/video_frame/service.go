@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/codec_experiment"
 	"github.com/berzz26/recall/services/api/internal/storage"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/berzz26/recall/services/api/internal/video_segment"
@@ -35,8 +36,11 @@ type Service struct {
 	// long for long videos. To avoid killing legitimate long extractions,
 	// GenerateForVideo does not impose a fixed 60s wall-clock timeout over
 	// the entire extraction.
-	ffmpegTimeout  time.Duration
-	jpegQuality    int
+	ffmpegTimeout time.Duration
+	jpegQuality   int
+	// TEMPORARY EXPERIMENT: nil unless CODECSIGHT_DYNAMIC_SAMPLING is set.
+	// When nil, GenerateForVideo follows the existing 2-second path exactly.
+	dynamicSampler *codec_experiment.DynamicSampler
 }
 
 func NewService(repo *Repository, store storage.Storage, sampleInterval time.Duration, ffmpegPath string, ffmpegTimeout time.Duration, jpegQuality int) *Service {
@@ -53,6 +57,19 @@ func NewService(repo *Repository, store storage.Storage, sampleInterval time.Dur
 		jpegQuality = 85
 	}
 	return &Service{repo: repo, storage: store, sampleInterval: sampleInterval, ffmpegPath: ffmpegPath, ffmpegTimeout: ffmpegTimeout, jpegQuality: jpegQuality}
+}
+
+// NewServiceWithDynamicSampler is TEMPORARY experiment wiring. A nil sampler
+// preserves the existing constructor behavior exactly.
+func NewServiceWithDynamicSampler(repo *Repository, store storage.Storage, sampleInterval time.Duration, ffmpegPath string, ffmpegTimeout time.Duration, jpegQuality int, dynamicSampler *codec_experiment.DynamicSampler) *Service {
+	s := NewService(repo, store, sampleInterval, ffmpegPath, ffmpegTimeout, jpegQuality)
+	s.dynamicSampler = dynamicSampler
+	return s
+}
+
+// DynamicEnabled reports whether the experimental dynamic sampling path may run.
+func (s *Service) DynamicEnabled() bool {
+	return s != nil && s.dynamicSampler != nil && s.dynamicSampler.Enabled()
 }
 
 func SampleTimestamps(durationSeconds float64, interval time.Duration) ([]float64, error) {
@@ -94,6 +111,10 @@ func FindSegment(segments []video_segment.VideoSegment, timestamp float64) *vide
 
 func frameStorageKey(videoID uuid.UUID, frameIndex int) string {
 	return fmt.Sprintf("videos/%s/frames/%06d.jpg", videoID.String(), frameIndex)
+}
+
+func roundMicroTimestamp(ts float64) int64 {
+	return int64(math.Round(ts * 1e6))
 }
 
 // limitedWriter caps stderr capture to avoid unbounded memory.
@@ -211,8 +232,38 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 		}
 	}
 
-	// Single-process streaming FFmpeg extraction: continuous decode via fps filter
+	// Single-process streaming FFmpeg extraction: continuous decode via fps filter.
+	// The dynamic experiment keeps this mechanism and only changes which dense
+	// outputs are retained. Baseline mode always retains every output.
 	intervalSec := s.sampleInterval.Seconds()
+	expectedTimestamps := timestamps
+	keepSelected := map[int64]bool(nil)
+	dynamicActive := false
+	if s.DynamicEnabled() {
+		dynRes, dynErr := s.dynamicSampler.RunDynamic(ctx, videoPath, v.ID.String(), durationSeconds, s.sampleInterval)
+		if dynErr != nil {
+			slog.Warn("frame: dynamic sampling unavailable, using baseline sampling",
+				"video_id", v.ID.String(), "error", dynErr)
+		} else {
+			fmt.Fprintln(os.Stderr, dynRes.Report)
+			if dynRes.Plan.Summary.Mode == "dynamic" && len(dynRes.Plan.SelectedTimestamps) > 0 {
+				intervalSec = dynRes.Plan.Config.DenseInterval.Seconds()
+				expectedTimestamps = dynRes.Plan.SelectedTimestamps
+				keepSelected = dynRes.Plan.KeepKeys()
+				dynamicActive = true
+				slog.Info("frame: dynamic sampling plan selected",
+					"video_id", v.ID.String(),
+					"baseline_frames", dynRes.Plan.Summary.BaselineCount,
+					"dynamic_frames", dynRes.Plan.Summary.DynamicCount,
+					"regions", dynRes.Plan.Summary.RegionCount)
+			} else {
+				slog.Info("frame: dynamic sampler active but no additional regions selected",
+					"video_id", v.ID.String(),
+					"mode", dynRes.Plan.Summary.Mode,
+					"reason", dynRes.Plan.Summary.Reason)
+			}
+		}
+	}
 	fpsVal := 1.0 / intervalSec
 	fpsFilter := fmt.Sprintf("fps=%.6f:round=up", fpsVal)
 
@@ -279,6 +330,7 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 	buffer := make([]byte, 0, 128*1024)
 	tmpRead := make([]byte, 32*1024)
 	jpegIndex := 0
+	lastStoredTs := 0.0
 	ffmpegProcessCount := 1
 
 	// Helper to persist batch in bounded manner
@@ -344,6 +396,12 @@ loopRead:
 					// However fps should not produce beyond; if it does, ignore.
 					continue
 				}
+				if keepSelected != nil && !keepSelected[roundMicroTimestamp(ts)] {
+					// Dynamic mode decodes the dense grid once, then retains only the
+					// planned baseline and high-activity timestamps.
+					jpegIndex++
+					continue
+				}
 				seg := FindSegment(segments, ts)
 				if seg == nil {
 					readErrOuter = fmt.Errorf("no segment for timestamp %f", ts)
@@ -356,10 +414,11 @@ loopRead:
 					fw = cfg.Width
 					fh = cfg.Height
 				}
-				key := frameStorageKey(v.ID, jpegIndex)
+				storedIndex := len(allSaved) + len(batch)
+				key := frameStorageKey(v.ID, storedIndex)
 				saveStart := time.Now()
 				if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
-					readErrOuter = fmt.Errorf("failed to store frame %d: %w", jpegIndex, err)
+					readErrOuter = fmt.Errorf("failed to store frame %d: %w", storedIndex, err)
 					break loopRead
 				}
 				totalSaveMs += time.Since(saveStart).Milliseconds()
@@ -367,12 +426,13 @@ loopRead:
 				batch = append(batch, VideoFrame{
 					VideoID:          v.ID,
 					SegmentID:        seg.ID,
-					FrameIndex:       jpegIndex,
+					FrameIndex:       storedIndex,
 					TimestampSeconds: ts,
 					StorageKey:       key,
 					Width:            fw,
 					Height:           fh,
 				})
+				lastStoredTs = ts
 				if len(batch) >= 500 {
 					if err := persistBatch(); err != nil {
 						readErrOuter = fmt.Errorf("failed to persist frames: %w", err)
@@ -459,7 +519,7 @@ loopRead:
 	}
 
 	// If ffmpeg produced zero frames but expected some, treat as failure
-	if jpegIndex == 0 && len(timestamps) > 0 {
+	if jpegIndex == 0 && len(expectedTimestamps) > 0 {
 		cleanupOnFail()
 		msg := strings.TrimSpace(stderrBuf.String())
 		if len(msg) > 500 {
@@ -468,13 +528,13 @@ loopRead:
 		if msg == "" {
 			msg = "no frames extracted"
 		}
-		slog.Error("frame: no frames extracted", "video_id", v.ID.String(), "expected", len(timestamps), "got", jpegIndex, "duration_ms", ffmpegMs, "error", msg)
+		slog.Error("frame: no frames extracted", "video_id", v.ID.String(), "expected", len(expectedTimestamps), "got", jpegIndex, "duration_ms", ffmpegMs, "error", msg)
 		return nil, fmt.Errorf("ffmpeg failed: %s", msg)
 	}
 
 	// Note: jpegIndex may be slightly less/more than len(timestamps) due to fps rounding.
 	// We use deterministic timestamps, so we accept jpegIndex count. If mismatch, log warning.
-	if jpegIndex != len(timestamps) {
+	if !dynamicActive && jpegIndex != len(timestamps) {
 		slog.Warn("frame: frame count mismatch", "video_id", v.ID.String(), "expected", len(timestamps), "got", jpegIndex, "duration_seconds", durationSeconds, "interval", s.sampleInterval.String())
 	}
 
@@ -484,9 +544,22 @@ loopRead:
 	if len(allSaved) != jpegIndex {
 		// In case batch persist already done, allSaved holds all; verify
 	}
+	if dynamicActive {
+		storedCount := len(allSaved)
+		if storedCount == 0 && len(expectedTimestamps) > 0 {
+			cleanupOnFail()
+			slog.Error("frame: dynamic extraction stored no frames", "video_id", v.ID.String(), "expected", len(expectedTimestamps), "duration_ms", ffmpegMs)
+			return nil, fmt.Errorf("ffmpeg failed: dynamic extraction stored no frames")
+		}
+		if storedCount != len(expectedTimestamps) {
+			slog.Warn("frame: dynamic frame count mismatch", "video_id", v.ID.String(), "expected", len(expectedTimestamps), "got", storedCount, "duration_seconds", durationSeconds)
+		}
+	}
 
 	var finalTimestamp float64
-	if jpegIndex > 0 {
+	if dynamicActive {
+		finalTimestamp = lastStoredTs
+	} else if jpegIndex > 0 {
 		finalTimestamp = float64(jpegIndex-1) * intervalSec
 	}
 

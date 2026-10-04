@@ -70,6 +70,21 @@ type Config struct {
 	CodecExperimentScript    string
 	CodecExperimentMaxFrames int
 	CodecExperimentTimeout   time.Duration
+
+	// TEMPORARY EXPERIMENT (dynamic codec-activity sampler). Off by default.
+	DynamicSamplingEnabled bool
+	DynamicDenseInterval   time.Duration
+	DynamicWindowBefore    time.Duration
+	DynamicWindowAfter     time.Duration
+	DynamicMergeGap        time.Duration
+	DynamicWeightMean      float64
+	DynamicWeightMax       float64
+	DynamicWeightStatic    float64
+	DynamicWeightPacket    float64
+	DynamicEnterThreshold  float64
+	DynamicExitThreshold   float64
+	DynamicLowPercentile   float64
+	DynamicHighPercentile  float64
 }
 
 func Load() Config {
@@ -558,6 +573,142 @@ func Load() Config {
 		codecExperimentTimeout = d
 	}
 
+	// TEMPORARY EXPERIMENT: dynamic codec-activity sampling. Default off.
+	dynamicSamplingEnabled := false
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_SAMPLING"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			dynamicSamplingEnabled = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			dynamicSamplingEnabled = false
+		default:
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_SAMPLING %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	dynamicDenseInterval := 200 * time.Millisecond
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_DENSE_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_DENSE_INTERVAL %q: must be a positive duration", v))
+		}
+		dynamicDenseInterval = d
+	}
+
+	dynamicWindowBefore := 1 * time.Second
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WINDOW_BEFORE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WINDOW_BEFORE %q: must be a duration >= 0", v))
+		}
+		dynamicWindowBefore = d
+	}
+
+	dynamicWindowAfter := 1 * time.Second
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WINDOW_AFTER"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WINDOW_AFTER %q: must be a duration >= 0", v))
+		}
+		dynamicWindowAfter = d
+	}
+
+	dynamicMergeGap := 1 * time.Second
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_MERGE_GAP"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_MERGE_GAP %q: must be a duration >= 0", v))
+		}
+		dynamicMergeGap = d
+	}
+
+	dynamicWeightMean := 0.40
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WEIGHT_MEAN"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WEIGHT_MEAN %q: must be a number >= 0", v))
+		}
+		dynamicWeightMean = parsed
+	}
+
+	dynamicWeightMax := 0.20
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WEIGHT_MAX"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WEIGHT_MAX %q: must be a number >= 0", v))
+		}
+		dynamicWeightMax = parsed
+	}
+
+	dynamicWeightStatic := 0.25
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WEIGHT_STATIC"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WEIGHT_STATIC %q: must be a number >= 0", v))
+		}
+		dynamicWeightStatic = parsed
+	}
+
+	dynamicWeightPacket := 0.15
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_WEIGHT_PACKET"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_WEIGHT_PACKET %q: must be a number >= 0", v))
+		}
+		dynamicWeightPacket = parsed
+	}
+
+	dynamicEnterThreshold := 0.90
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_ENTER_THRESHOLD"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_ENTER_THRESHOLD %q: must be a number", v))
+		}
+		dynamicEnterThreshold = parsed
+	}
+
+	dynamicExitThreshold := 0.70
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_EXIT_THRESHOLD"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_EXIT_THRESHOLD %q: must be a number", v))
+		}
+		dynamicExitThreshold = parsed
+	}
+
+	dynamicLowPercentile := 5.0
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_LOW_PERCENTILE"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_LOW_PERCENTILE %q: must be a number", v))
+		}
+		dynamicLowPercentile = parsed
+	}
+
+	dynamicHighPercentile := 95.0
+	if v := os.Getenv("CODECSIGHT_DYNAMIC_HIGH_PERCENTILE"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_HIGH_PERCENTILE %q: must be a number", v))
+		}
+		dynamicHighPercentile = parsed
+	}
+
+	if dynamicSamplingEnabled {
+		if dynamicDenseInterval >= frameSampleInterval {
+			panic(fmt.Sprintf("invalid CODECSIGHT_DYNAMIC_DENSE_INTERVAL %s: must be shorter than FRAME_SAMPLE_INTERVAL %s", dynamicDenseInterval, frameSampleInterval))
+		}
+		if dynamicWeightMean+dynamicWeightMax+dynamicWeightStatic+dynamicWeightPacket <= 0 {
+			panic("invalid dynamic codec weights: at least one weight must be > 0")
+		}
+		if !(dynamicEnterThreshold > dynamicExitThreshold) {
+			panic(fmt.Sprintf("invalid dynamic thresholds: enter (%.4f) must be greater than exit (%.4f)", dynamicEnterThreshold, dynamicExitThreshold))
+		}
+		if !(dynamicLowPercentile >= 0 && dynamicLowPercentile < dynamicHighPercentile && dynamicHighPercentile <= 100) {
+			panic(fmt.Sprintf("invalid dynamic percentiles: must satisfy 0 <= low (%.4f) < high (%.4f) <= 100", dynamicLowPercentile, dynamicHighPercentile))
+		}
+	}
+
 	return Config{
 		Env:                    env,
 		Port:                   port,
@@ -616,5 +767,19 @@ func Load() Config {
 		CodecExperimentScript:    codecExperimentScript,
 		CodecExperimentMaxFrames: codecExperimentMaxFrames,
 		CodecExperimentTimeout:   codecExperimentTimeout,
+
+		DynamicSamplingEnabled: dynamicSamplingEnabled,
+		DynamicDenseInterval:   dynamicDenseInterval,
+		DynamicWindowBefore:    dynamicWindowBefore,
+		DynamicWindowAfter:     dynamicWindowAfter,
+		DynamicMergeGap:        dynamicMergeGap,
+		DynamicWeightMean:      dynamicWeightMean,
+		DynamicWeightMax:       dynamicWeightMax,
+		DynamicWeightStatic:    dynamicWeightStatic,
+		DynamicWeightPacket:    dynamicWeightPacket,
+		DynamicEnterThreshold:  dynamicEnterThreshold,
+		DynamicExitThreshold:   dynamicExitThreshold,
+		DynamicLowPercentile:   dynamicLowPercentile,
+		DynamicHighPercentile:  dynamicHighPercentile,
 	}
 }
