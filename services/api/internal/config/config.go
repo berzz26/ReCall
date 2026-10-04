@@ -25,6 +25,7 @@ type Config struct {
 	FFprobeTimeout         time.Duration
 	SegmentDuration        time.Duration
 	FrameSampleInterval    time.Duration
+	SamplerBeta            float64
 	FFmpegPath             string
 	FFmpegTimeout          time.Duration
 	FrameJPEGQuality       int
@@ -148,6 +149,20 @@ func Load() Config {
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
 	if ffmpegPath == "" {
 		ffmpegPath = "ffmpeg"
+	}
+
+	// Sampler budget scale: B = ceil(beta * N_baseline). Phase 1 uses 1.0,
+	// so the adaptive sampler never sends more than N_baseline frames to YOLO.
+	samplerBeta := 1.0
+	if v := os.Getenv("SAMPLER_BETA"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid SAMPLER_BETA %q: %v", v, err))
+		}
+		if parsed <= 0 {
+			panic(fmt.Sprintf("SAMPLER_BETA must be > 0, got %s", v))
+		}
+		samplerBeta = parsed
 	}
 
 	ffmpegTimeout := 60 * time.Second
@@ -517,6 +532,7 @@ func Load() Config {
 		FFprobeTimeout:         ffprobeTimeout,
 		SegmentDuration:        segmentDuration,
 		FrameSampleInterval:    frameSampleInterval,
+		SamplerBeta:            samplerBeta,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,

@@ -8,22 +8,37 @@ import (
 	_ "image/jpeg"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/storage"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/berzz26/recall/services/api/internal/video_segment"
 )
 
+// frameRepository is the persistence seam used by Service. *Repository
+// implements it; tests inject fakes. The constructor keeps taking
+// *Repository so existing call sites are unaffected.
+type frameRepository interface {
+	GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error)
+	DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error
+	CreateBatch(ctx context.Context, frames []VideoFrame) ([]VideoFrame, error)
+}
+
+// extractFunc extracts one frame at the given timestamp and returns the
+// JPEG bytes. It is a field (not a hard ffmpeg call) so tests can stub the
+// decoder while exercising the planner -> extractor contract.
+type extractFunc func(ctx context.Context, ffmpegPath, videoPath string, timestamp float64, jpegQuality int) ([]byte, error)
+
 type Service struct {
-	repo           *Repository
+	repo           frameRepository
 	storage        storage.Storage
 	sampleInterval time.Duration
 	ffmpegPath     string
@@ -32,11 +47,15 @@ type Service struct {
 	// individual FFmpeg subprocess before cancellation, NOT a whole-video
 	// wall-clock limit. The processing job lifetime is controlled by the
 	// parent processing context (worker/application) and may run arbitrarily
-	// long for long videos. To avoid killing legitimate long extractions,
-	// GenerateForVideo does not impose a fixed 60s wall-clock timeout over
-	// the entire extraction.
-	ffmpegTimeout  time.Duration
-	jpegQuality    int
+	// long for long videos.
+	ffmpegTimeout time.Duration
+	jpegQuality   int
+	// samplerBeta scales the baseline budget (B = ceil(beta * N_baseline)).
+	// Phase 1 uses 1.0. Configurable via SAMPLER_BETA.
+	samplerBeta float64
+	// extractOne performs single-timestamp decoding. Defaults to
+	// extractSingleFrame (ffmpeg seeking); tests override it.
+	extractOne extractFunc
 }
 
 func NewService(repo *Repository, store storage.Storage, sampleInterval time.Duration, ffmpegPath string, ffmpegTimeout time.Duration, jpegQuality int) *Service {
@@ -52,28 +71,23 @@ func NewService(repo *Repository, store storage.Storage, sampleInterval time.Dur
 	if jpegQuality < 1 || jpegQuality > 100 {
 		jpegQuality = 85
 	}
-	return &Service{repo: repo, storage: store, sampleInterval: sampleInterval, ffmpegPath: ffmpegPath, ffmpegTimeout: ffmpegTimeout, jpegQuality: jpegQuality}
+	return &Service{repo: repo, storage: store, sampleInterval: sampleInterval, ffmpegPath: ffmpegPath, ffmpegTimeout: ffmpegTimeout, jpegQuality: jpegQuality, samplerBeta: sampler.DefaultBeta, extractOne: extractSingleFrame}
 }
 
+// WithSamplerBeta sets the budget scale factor (B = ceil(beta * N_baseline))
+// and returns the service for chaining. Non-positive values keep the
+// current setting.
+func (s *Service) WithSamplerBeta(beta float64) *Service {
+	if beta > 0 {
+		s.samplerBeta = beta
+	}
+	return s
+}
+
+// SampleTimestamps delegates to the sampler package so the uniform grid is
+// defined in exactly one place. Kept for backward compatibility.
 func SampleTimestamps(durationSeconds float64, interval time.Duration) ([]float64, error) {
-	if interval <= 0 {
-		return nil, fmt.Errorf("frame sample interval must be > 0")
-	}
-	if math.IsNaN(durationSeconds) || math.IsInf(durationSeconds, 0) || durationSeconds <= 0 {
-		return nil, fmt.Errorf("video duration unavailable; cannot sample frames")
-	}
-	iv := interval.Seconds()
-	if iv <= 0 {
-		return nil, fmt.Errorf("frame sample interval must be > 0")
-	}
-	var ts []float64
-	for t := 0.0; t < durationSeconds-1e-9; t += iv {
-		ts = append(ts, t)
-	}
-	if len(ts) == 0 {
-		return nil, fmt.Errorf("video duration unavailable; cannot sample frames")
-	}
-	return ts, nil
+	return sampler.BaselineTimestamps(durationSeconds, interval)
 }
 
 func FindSegment(segments []video_segment.VideoSegment, timestamp float64) *video_segment.VideoSegment {
@@ -113,14 +127,28 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// GenerateForVideo is the legacy entry point. It now builds an explicit
+// baseline sampling plan (fixed 2-second grid, budget-capped) and delegates
+// to GenerateForVideoWithPlan, so effective frames are unchanged while the
+// planner/extractor separation is in force.
 func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, durationSeconds float64, width, height int) ([]VideoFrame, error) {
+	planner := sampler.NewBaselinePlanner(s.sampleInterval, s.samplerBeta)
+	plan, err := planner.Plan(v.ID, durationSeconds)
+	if err != nil {
+		return nil, err
+	}
+	return s.GenerateForVideoWithPlan(ctx, v, segments, plan, width, height)
+}
+
+// GenerateForVideoWithPlan materializes an explicit sampling plan: it
+// extracts exactly the plan's (normalized, budget-capped) timestamps as
+// VideoFrame objects. It never decides which frames are important; that is
+// the planner's job. The returned VideoFrame shape is unchanged, so YOLO,
+// ByteTrack, events, VLM, and embeddings are unaffected.
+func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, plan sampler.SamplingPlan, width, height int) ([]VideoFrame, error) {
 	frameStart := time.Now()
 	if s.storage == nil {
 		return nil, fmt.Errorf("storage not configured")
-	}
-	timestamps, err := SampleTimestamps(durationSeconds, s.sampleInterval)
-	if err != nil {
-		return nil, err
 	}
 	if len(segments) == 0 {
 		return nil, fmt.Errorf("no segments available for frame association")
@@ -128,72 +156,34 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 	if width <= 0 || height <= 0 {
 		return nil, fmt.Errorf("invalid dimensions")
 	}
-	slog.Info("frame: start",
+
+	// Defensive normalization + hard budget cap. Plans built by a Planner
+	// already satisfy these; re-applying keeps the extractor contract
+	// ("never more frames than the plan / budget allows") even for
+	// hand-built plans. Selection metadata stays on the plan side: the
+	// extractor only consumes the float list.
+	timestamps := sampler.NormalizeTimestamps(plan.Timestamps(), plan.DurationSeconds)
+	if plan.Budget.Cap > 0 {
+		timestamps = sampler.CapTimestamps(timestamps, plan.Budget.Cap)
+	}
+	if len(timestamps) > len(plan.Entries) {
+		timestamps = timestamps[:len(plan.Entries)]
+	}
+
+	slog.Info("frame: plan",
 		"video_id", v.ID.String(),
-		"duration_seconds", durationSeconds,
-		"frame_count", len(timestamps),
-		"interval", s.sampleInterval.String(),
+		"mode", plan.Mode,
+		"duration_seconds", plan.DurationSeconds,
+		"baseline_count", plan.Budget.BaselineCount,
+		"budget_cap", plan.Budget.Cap,
+		"requested", len(plan.Entries),
+		"extracting", len(timestamps),
 		"width", width, "height", height,
 		"ffmpeg", s.ffmpegPath, "jpeg_quality", s.jpegQuality,
 	)
 
-	var videoPath string
-	var tempVideo string
-	var cleanupVideo func()
-
-	if v.SourceType == video.SourceTypeLocal {
-		if v.SourcePath == nil || *v.SourcePath == "" {
-			return nil, fmt.Errorf("missing source_path for LOCAL video")
-		}
-		videoPath = *v.SourcePath
-		if _, err := os.Stat(videoPath); err != nil {
-			return nil, fmt.Errorf("source file not found: %w", err)
-		}
-	} else {
-		if v.StorageKey == nil || *v.StorageKey == "" {
-			return nil, fmt.Errorf("missing storage_key for UPLOAD video")
-		}
-		// Prefer direct filesystem path if storage is LocalStorage to avoid extra copy.
-		// Fallback to single copy via temp file for other storage implementations.
-		useDirect := false
-		if ls, ok := s.storage.(*storage.LocalStorage); ok {
-			candidate := filepath.Join(ls.Root(), *v.StorageKey)
-			if _, err := os.Stat(candidate); err == nil {
-				videoPath = candidate
-				useDirect = true
-			}
-		}
-		if !useDirect {
-			rc, err := s.storage.Open(ctx, *v.StorageKey)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open storage: %w", err)
-			}
-			ext := filepath.Ext(*v.StorageKey)
-			if ext == "" {
-				ext = ".mp4"
-			}
-			tmp, err := os.CreateTemp("", "frame-src-*"+ext)
-			if err != nil {
-				rc.Close()
-				return nil, fmt.Errorf("failed to create temp video: %w", err)
-			}
-			tempVideo = tmp.Name()
-			cleanupVideo = func() { os.Remove(tempVideo) }
-			if _, err := io.Copy(tmp, rc); err != nil {
-				tmp.Close()
-				rc.Close()
-				cleanupVideo()
-				return nil, fmt.Errorf("failed to copy to temp video: %w", err)
-			}
-			tmp.Close()
-			rc.Close()
-			videoPath = tempVideo
-		}
-	}
-	if cleanupVideo != nil {
-		defer cleanupVideo()
-	}
-
+	// Replace previously extracted frames (idempotent regeneration),
+	// mirroring legacy behavior.
 	existing, err := s.repo.GetByVideoID(ctx, v.ID)
 	if err != nil {
 		return nil, err
@@ -211,58 +201,27 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 		}
 	}
 
-	// Single-process streaming FFmpeg extraction: continuous decode via fps filter
-	intervalSec := s.sampleInterval.Seconds()
-	fpsVal := 1.0 / intervalSec
-	fpsFilter := fmt.Sprintf("fps=%.6f:round=up", fpsVal)
-
-	q := fmt.Sprintf("%d", s.jpegQuality)
-
-	// Prepare ffmpeg args: continuous decode, fps sampling, JPEG via pipe
-	// Do NOT use -ss per-frame seeks. Decode sequentially once.
-	args := []string{
-		"-loglevel", "error",
-		"-i", videoPath,
-		"-vf", fpsFilter,
-		"-q:v", q,
-		"-f", "image2pipe",
-		"-vcodec", "mjpeg",
-		"pipe:1",
+	if len(timestamps) == 0 {
+		slog.Info("frame: complete (empty plan)", "video_id", v.ID.String(), "frame_count", 0)
+		return []VideoFrame{}, nil
 	}
 
-	// FFmpeg subprocess is supervised by the parent processing context.
-	// FFMPEG_TIMEOUT is no longer used as a whole-video wall-clock timeout.
-	// The extraction may run arbitrarily long for long videos; cancellation
-	// propagates from ctx (worker shutdown / application cancellation).
-	cmd := exec.CommandContext(ctx, s.ffmpegPath, args...)
-	// Separate stderr, stdout is JPEG stream
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &limitedWriter{buf: &stderrBuf, limit: 8192}
-
-	stdout, err := cmd.StdoutPipe()
+	// Batch extraction: the source video path is resolved ONCE for the whole
+	// timestamp batch, then each timestamp is seek-extracted. Seeking (rather
+	// than decoding the entire video and discarding frames) keeps sparse
+	// future plans cheap; dense baseline plans decode only what they need.
+	videoPath, cleanupVideo, err := s.resolveVideoPath(ctx, v)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+		return nil, err
 	}
-
-	ffmpegStart := time.Now()
-	if err := cmd.Start(); err != nil {
-		msg := strings.TrimSpace(stderrBuf.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return nil, fmt.Errorf("ffmpeg failed to start: %s", msg)
+	if cleanupVideo != nil {
+		defer cleanupVideo()
 	}
-
-	// Ensure process cleanup on early return
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	}()
 
 	var createdKeys []string
 	var batch []VideoFrame
 	var allSaved []VideoFrame
+	var totalExtractMs int64
 	var totalSaveMs int64
 	var persistMs int64
 
@@ -270,18 +229,9 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 		for _, k := range createdKeys {
 			_ = s.storage.Delete(ctx, k)
 		}
-		// Remove any DB rows already persisted in batches
 		_ = s.repo.DeleteByVideoID(ctx, v.ID)
 	}
 
-	// Streaming JPEG boundary parsing
-	// JPEG SOI = FF D8, EOI = FF D9
-	buffer := make([]byte, 0, 128*1024)
-	tmpRead := make([]byte, 32*1024)
-	jpegIndex := 0
-	ffmpegProcessCount := 1
-
-	// Helper to persist batch in bounded manner
 	persistBatch := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -297,211 +247,193 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 		return nil
 	}
 
-	readErrOuter := error(nil)
-loopRead:
-	for {
-		n, readErr := stdout.Read(tmpRead)
-		if n > 0 {
-			buffer = append(buffer, tmpRead[:n]...)
-			// Extract as many JPEGs as possible from buffer
-			for {
-				soi := bytes.Index(buffer, []byte{0xFF, 0xD8})
-				if soi == -1 {
-					if len(buffer) > 0 && buffer[len(buffer)-1] == 0xFF {
-						// Keep trailing FF for split marker
-						buffer = buffer[len(buffer)-1:]
-					} else {
-						buffer = buffer[:0]
-					}
-					break
-				}
-				if soi > 0 {
-					buffer = buffer[soi:]
-				}
-				if len(buffer) < 2 {
-					break
-				}
-				// Search EOI after SOI
-				eoi := bytes.Index(buffer[2:], []byte{0xFF, 0xD9})
-				if eoi == -1 {
-					if len(buffer) > 10*1024*1024 {
-						readErrOuter = fmt.Errorf("jpeg frame too large or missing EOI")
-						break loopRead
-					}
-					break
-				}
-				eoiPos := 2 + eoi + 2
-				jpegBytes := make([]byte, eoiPos)
-				copy(jpegBytes, buffer[:eoiPos])
-				buffer = buffer[eoiPos:]
-
-				ts := float64(jpegIndex) * intervalSec
-				if ts >= durationSeconds-1e-9 {
-					// Beyond duration, skip but still count index to preserve alignment?
-					// Spec says do not create frames beyond duration, so skip persisting.
-					jpegIndex++
-					// If we skip, we should still continue to next JPEG but not store.
-					// However fps should not produce beyond; if it does, ignore.
-					continue
-				}
-				seg := FindSegment(segments, ts)
-				if seg == nil {
-					readErrOuter = fmt.Errorf("no segment for timestamp %f", ts)
-					break loopRead
-				}
-				// Determine dimensions without full decode
-				cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes))
-				fw, fh := width, height
-				if cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
-					fw = cfg.Width
-					fh = cfg.Height
-				}
-				key := frameStorageKey(v.ID, jpegIndex)
-				saveStart := time.Now()
-				if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
-					readErrOuter = fmt.Errorf("failed to store frame %d: %w", jpegIndex, err)
-					break loopRead
-				}
-				totalSaveMs += time.Since(saveStart).Milliseconds()
-				createdKeys = append(createdKeys, key)
-				batch = append(batch, VideoFrame{
-					VideoID:          v.ID,
-					SegmentID:        seg.ID,
-					FrameIndex:       jpegIndex,
-					TimestampSeconds: ts,
-					StorageKey:       key,
-					Width:            fw,
-					Height:           fh,
-				})
-				if len(batch) >= 500 {
-					if err := persistBatch(); err != nil {
-						readErrOuter = fmt.Errorf("failed to persist frames: %w", err)
-						break loopRead
-					}
-				}
-				if (jpegIndex+1)%1000 == 0 {
-					slog.Info("frame: progress", "video_id", v.ID.String(), "frames", jpegIndex+1, "timestamp", ts, "elapsed_ms", time.Since(frameStart).Milliseconds())
-				}
-				jpegIndex++
+	for i, ts := range timestamps {
+		if err := ctx.Err(); err != nil {
+			cleanupOnFail()
+			return nil, err
+		}
+		seg := FindSegment(segments, ts)
+		if seg == nil {
+			cleanupOnFail()
+			return nil, fmt.Errorf("no segment for timestamp %f", ts)
+		}
+		extractStart := time.Now()
+		jpegBytes, err := s.extractOne(ctx, s.ffmpegPath, videoPath, ts, s.jpegQuality)
+		totalExtractMs += time.Since(extractStart).Milliseconds()
+		if err != nil {
+			cleanupOnFail()
+			if ctx.Err() == context.DeadlineExceeded {
+				slog.Error("frame: ffmpeg timeout", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
+				return nil, fmt.Errorf("ffmpeg timeout: %w", ctx.Err())
+			}
+			if ctx.Err() == context.Canceled {
+				slog.Error("frame: context canceled", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
+				return nil, fmt.Errorf("context canceled: %w", ctx.Err())
+			}
+			slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "timestamp", ts, "error", err)
+			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
+		}
+		fw, fh := width, height
+		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
+			fw = cfg.Width
+			fh = cfg.Height
+		}
+		key := frameStorageKey(v.ID, i)
+		saveStart := time.Now()
+		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
+			cleanupOnFail()
+			return nil, fmt.Errorf("failed to store frame %d: %w", i, err)
+		}
+		totalSaveMs += time.Since(saveStart).Milliseconds()
+		createdKeys = append(createdKeys, key)
+		batch = append(batch, VideoFrame{
+			VideoID:          v.ID,
+			SegmentID:        seg.ID,
+			FrameIndex:       i,
+			TimestampSeconds: ts,
+			StorageKey:       key,
+			Width:            fw,
+			Height:           fh,
+		})
+		if len(batch) >= 500 {
+			if err := persistBatch(); err != nil {
+				cleanupOnFail()
+				return nil, fmt.Errorf("failed to persist frames: %w", err)
 			}
 		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			// Check parent context cancellation (A.2: processing lifetime controls FFmpeg)
-			if ctx.Err() != nil {
-				readErrOuter = ctx.Err()
-				break
-			}
-			readErrOuter = readErr
-			break
+		if (i+1)%1000 == 0 {
+			slog.Info("frame: progress", "video_id", v.ID.String(), "frames", i+1, "timestamp", ts, "elapsed_ms", time.Since(frameStart).Milliseconds())
 		}
 	}
 
-	// Wait for ffmpeg to exit
-	waitErr := cmd.Wait()
-	ffmpegMs := time.Since(ffmpegStart).Milliseconds()
-
-	// Handle read outer error before checking ffmpeg exit
-	if readErrOuter != nil {
-		cleanupOnFail()
-		if ctx.Err() == context.DeadlineExceeded {
-			slog.Error("frame: ffmpeg timeout", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", ctx.Err())
-			return nil, fmt.Errorf("ffmpeg timeout: %w", ctx.Err())
-		}
-		if ctx.Err() == context.Canceled {
-			slog.Error("frame: context canceled", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", ctx.Err())
-			return nil, fmt.Errorf("context canceled: %w", ctx.Err())
-		}
-		// If ffmpeg also failed, include stderr
-		if waitErr != nil {
-			msg := strings.TrimSpace(stderrBuf.String())
-			if len(msg) > 500 {
-				msg = msg[:500]
-			}
-			if msg == "" {
-				msg = readErrOuter.Error()
-			}
-			slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", msg)
-			return nil, fmt.Errorf("ffmpeg failed: %s", msg)
-		}
-		slog.Error("frame: failed", "video_id", v.ID.String(), "error", readErrOuter)
-		return nil, readErrOuter
-	}
-
-	if waitErr != nil {
-		cleanupOnFail()
-		msg := strings.TrimSpace(stderrBuf.String())
-		if len(msg) > 500 {
-			msg = msg[:500]
-		}
-		if msg == "" {
-			msg = waitErr.Error()
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			slog.Error("frame: ffmpeg timeout", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", ctx.Err())
-			return nil, fmt.Errorf("ffmpeg timeout: %w", ctx.Err())
-		}
-		if ctx.Err() == context.Canceled {
-			slog.Error("frame: context canceled", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", ctx.Err())
-			return nil, fmt.Errorf("context canceled: %w", ctx.Err())
-		}
-		slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "duration_ms", ffmpegMs, "error", msg)
-		return nil, fmt.Errorf("ffmpeg failed: %s", msg)
-	}
-
-	// Flush remaining batch
 	if err := persistBatch(); err != nil {
 		cleanupOnFail()
 		slog.Error("frame: persist failed", "video_id", v.ID.String(), "duration_ms", persistMs, "error", err)
 		return nil, fmt.Errorf("failed to persist frames: %w", err)
 	}
 
-	// If ffmpeg produced zero frames but expected some, treat as failure
-	if jpegIndex == 0 && len(timestamps) > 0 {
-		cleanupOnFail()
+	// Contract guarantee: never return more frames than the plan requested.
+	if len(allSaved) > len(plan.Entries) {
+		allSaved = allSaved[:len(plan.Entries)]
+	}
+
+	totalMs := time.Since(frameStart).Milliseconds()
+	var finalTimestamp float64
+	if len(allSaved) > 0 {
+		finalTimestamp = allSaved[len(allSaved)-1].TimestampSeconds
+	}
+	var avgMs float64
+	if len(allSaved) > 0 {
+		avgMs = float64(totalMs) / float64(len(allSaved))
+	}
+	slog.Info("frame: complete",
+		"video_id", v.ID.String(),
+		"frame_count", len(allSaved),
+		"total_duration_ms", totalMs,
+		"extract_total_ms", totalExtractMs,
+		"save_total_ms", totalSaveMs,
+		"persist_ms", persistMs,
+		"avg_ms_per_frame", avgMs,
+		"final_timestamp", finalTimestamp,
+	)
+	return allSaved, nil
+}
+
+// resolveVideoPath maps a video to a local file path, downloading uploaded
+// videos to a temp file once per batch. The caller runs cleanup when done.
+func (s *Service) resolveVideoPath(ctx context.Context, v *video.Video) (string, func(), error) {
+	if v.SourceType == video.SourceTypeLocal {
+		if v.SourcePath == nil || *v.SourcePath == "" {
+			return "", nil, fmt.Errorf("missing source_path for LOCAL video")
+		}
+		if _, err := os.Stat(*v.SourcePath); err != nil {
+			return "", nil, fmt.Errorf("source file not found: %w", err)
+		}
+		return *v.SourcePath, nil, nil
+	}
+	if v.StorageKey == nil || *v.StorageKey == "" {
+		return "", nil, fmt.Errorf("missing storage_key for UPLOAD video")
+	}
+	// Prefer direct filesystem path if storage is LocalStorage to avoid extra copy.
+	if ls, ok := s.storage.(*storage.LocalStorage); ok {
+		candidate := filepath.Join(ls.Root(), *v.StorageKey)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil, nil
+		}
+	}
+	rc, err := s.storage.Open(ctx, *v.StorageKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to open storage: %w", err)
+	}
+	ext := filepath.Ext(*v.StorageKey)
+	if ext == "" {
+		ext = ".mp4"
+	}
+	tmp, err := os.CreateTemp("", "frame-src-*"+ext)
+	if err != nil {
+		rc.Close()
+		return "", nil, fmt.Errorf("failed to create temp video: %w", err)
+	}
+	tempVideo := tmp.Name()
+	cleanup := func() { os.Remove(tempVideo) }
+	if _, err := io.Copy(tmp, rc); err != nil {
+		tmp.Close()
+		rc.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("failed to copy to temp video: %w", err)
+	}
+	tmp.Close()
+	rc.Close()
+	return tempVideo, cleanup, nil
+}
+
+// extractSingleFrame decodes exactly one frame at the requested timestamp
+// using ffmpeg seeking (-ss before -i: fast seek without decoding the whole
+// file). Accuracy is subject to normal decoder limitations (seek lands on or
+// near the requested timestamp); the extractor records the requested
+// timestamp on the VideoFrame.
+func extractSingleFrame(ctx context.Context, ffmpegPath, videoPath string, timestamp float64, jpegQuality int) ([]byte, error) {
+	tmp, err := os.CreateTemp("", "frame-seek-*.jpg")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp frame: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	tsArg := strconv.FormatFloat(timestamp, 'f', 6, 64)
+	args := []string{
+		"-loglevel", "error",
+		"-y",
+		"-ss", tsArg,
+		"-i", videoPath,
+		"-frames:v", "1",
+		"-q:v", strconv.Itoa(jpegQuality),
+		"-f", "image2",
+		"-vcodec", "mjpeg",
+		tmpPath,
+	}
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{buf: &stderrBuf, limit: 8192}
+	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderrBuf.String())
 		if len(msg) > 500 {
 			msg = msg[:500]
 		}
 		if msg == "" {
-			msg = "no frames extracted"
+			msg = err.Error()
 		}
-		slog.Error("frame: no frames extracted", "video_id", v.ID.String(), "expected", len(timestamps), "got", jpegIndex, "duration_ms", ffmpegMs, "error", msg)
-		return nil, fmt.Errorf("ffmpeg failed: %s", msg)
+		return nil, fmt.Errorf("ffmpeg seek to %f failed: %s", timestamp, msg)
 	}
-
-	// Note: jpegIndex may be slightly less/more than len(timestamps) due to fps rounding.
-	// We use deterministic timestamps, so we accept jpegIndex count. If mismatch, log warning.
-	if jpegIndex != len(timestamps) {
-		slog.Warn("frame: frame count mismatch", "video_id", v.ID.String(), "expected", len(timestamps), "got", jpegIndex, "duration_seconds", durationSeconds, "interval", s.sampleInterval.String())
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read extracted frame: %w", err)
 	}
-
-	totalMs := time.Since(frameStart).Milliseconds()
-	// allSaved already contains persisted frames; if we used batch persisting, allSaved length == jpegIndex (skipping beyond-duration)
-	// Ensure we return in order
-	if len(allSaved) != jpegIndex {
-		// In case batch persist already done, allSaved holds all; verify
+	if len(data) == 0 {
+		return nil, fmt.Errorf("ffmpeg produced empty frame at %f", timestamp)
 	}
-
-	var finalTimestamp float64
-	if jpegIndex > 0 {
-		finalTimestamp = float64(jpegIndex-1) * intervalSec
-	}
-
-	slog.Info("frame: complete",
-		"video_id", v.ID.String(),
-		"frame_count", len(allSaved),
-		"total_duration_ms", totalMs,
-		"ffmpeg_total_ms", ffmpegMs,
-		"ffmpeg_process_count", ffmpegProcessCount,
-		"save_total_ms", totalSaveMs,
-		"persist_ms", persistMs,
-		"avg_ms_per_frame", float64(totalMs)/float64(len(allSaved)),
-		"final_timestamp", finalTimestamp,
-	)
-	return allSaved, nil
+	return data, nil
 }
 
 func (s *Service) GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error) {
