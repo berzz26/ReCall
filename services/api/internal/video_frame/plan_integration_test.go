@@ -9,13 +9,16 @@ import (
 	"context"
 	"math"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/detector"
 	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/storage"
+	"github.com/berzz26/recall/services/api/internal/tracker"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/berzz26/recall/services/api/internal/video_segment"
 )
@@ -177,4 +180,124 @@ func TestIntegrationAdaptiveCoarse(t *testing.T) {
 			t.Fatalf("frame %d file missing", i)
 		}
 	}
+}
+
+// TestIntegrationDisagreementFlow is the Phase 3 integration (no refinement):
+// adaptive coarse plan -> GenerateForVideoWithPlan (real ffmpeg) -> YOLO
+// (fake analyzer with a designed disappearance) -> throwaway disagreement
+// scorer -> IntervalScore[]. Production tracking is untouched.
+func TestIntegrationDisagreementFlow(t *testing.T) {
+	const fixture = "/home/berzz/recallTestVideo/video2.mp4"
+	const duration = 11.907
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("video fixture not found: %v", err)
+	}
+	if _, err := os.Stat("/usr/bin/ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := storage.NewLocalStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	srcType := video.SourceTypeLocal
+	srcPath := fixture
+	v := &video.Video{ID: uuid.New(), Filename: "video2.mp4", SourceType: srcType, SourcePath: &srcPath}
+	segs := []video_segment.VideoSegment{
+		{ID: uuid.New(), VideoID: v.ID, SegmentIndex: 0, StartTime: 0, EndTime: duration, Duration: duration},
+	}
+	repo := &fakeRepo{}
+	svc := NewService(nil, store, 2*time.Second, "ffmpeg", 30*time.Second, 85)
+	svc.repo = repo
+
+	// Phase 2 coarse plan from the real probe.
+	planner := sampler.NewAdaptiveCoarsePlanner(sampler.DefaultAdaptiveConfig())
+	pres, err := planner.PlanVideo(ctx, v.ID, fixture, duration)
+	if err != nil {
+		t.Fatalf("PlanVideo: %v", err)
+	}
+	if pres.Plan.Mode != sampler.ModeAdaptive {
+		t.Fatalf("want adaptive plan, got %q (fallback %q)", pres.Plan.Mode, pres.FallbackReason)
+	}
+	if pres.Plan.Len() < 2 {
+		t.Fatalf("need >=2 coarse timestamps, got %d", pres.Plan.Len())
+	}
+
+	frames, err := svc.GenerateForVideoWithPlan(ctx, v, segs, pres.Plan, 1280, 720)
+	if err != nil {
+		t.Fatalf("GenerateForVideoWithPlan: %v", err)
+	}
+
+	// Fake YOLO: stable person while ts < 6s, then it disappears.
+	analyzer := &detector.SingleFakeAnalyzer{
+		Fn: func(fr detector.FrameInput) []detector.DetectionResult {
+			if fr.Timestamp < 6.0 {
+				return []detector.DetectionResult{
+					{Label: "person", Confidence: 0.9, BBoxX: 0.3, BBoxY: 0.3, BBoxWidth: 0.2, BBoxHeight: 0.2},
+				}
+			}
+			return nil
+		},
+	}
+	var detInputs []detector.FrameInput
+	for _, f := range frames {
+		detInputs = append(detInputs, detector.FrameInput{
+			FrameID: f.ID, VideoID: f.VideoID, SegmentID: f.SegmentID,
+			Timestamp: f.TimestampSeconds, Width: f.Width, Height: f.Height,
+			StorageKey: f.StorageKey,
+		})
+	}
+	results, err := analyzer.AnalyzeBatch(ctx, detInputs)
+	if err != nil {
+		t.Fatalf("AnalyzeBatch: %v", err)
+	}
+
+	var tframes []tracker.FrameInput
+	byFrame := make(map[uuid.UUID][]tracker.DetectionInput)
+	for _, f := range frames {
+		tframes = append(tframes, tracker.FrameInput{FrameID: f.ID, Timestamp: f.TimestampSeconds})
+		for _, r := range results[f.ID] {
+			byFrame[f.ID] = append(byFrame[f.ID], tracker.DetectionInput{
+				ID: uuid.New(), Label: r.Label, Confidence: r.Confidence,
+				BBoxX: r.BBoxX, BBoxY: r.BBoxY, BBoxWidth: r.BBoxWidth, BBoxHeight: r.BBoxHeight,
+				FrameID: f.ID, Timestamp: f.TimestampSeconds,
+			})
+		}
+	}
+	scores, err := sampler.ScoreIntervals(ctx, tframes, byFrame, sampler.DefaultDisagreementConfig())
+	if err != nil {
+		t.Fatalf("ScoreIntervals: %v", err)
+	}
+	if len(scores) != len(frames)-1 {
+		t.Fatalf("want %d interval scores, got %d", len(frames)-1, len(scores))
+	}
+	// The designed disappearance must surface as a death in exactly the
+	// interval crossing 6s.
+	deathIntervals := 0
+	for i, s := range scores {
+		if s.StartTimestamp >= s.EndTimestamp || s.GapSeconds <= 0 {
+			t.Fatalf("interval %d malformed: %+v", i, s)
+		}
+		if i > 0 && s.StartTimestamp != scores[i-1].EndTimestamp {
+			t.Fatalf("intervals not contiguous at %d", i)
+		}
+		if s.StartTimestamp < 6.0 && s.EndTimestamp >= 6.0 {
+			deathIntervals++
+			if s.Deaths != 1 {
+				t.Fatalf("crossing interval must record the death: %+v", s)
+			}
+		}
+	}
+	if deathIntervals != 1 {
+		t.Fatalf("want exactly 1 interval crossing 6s, got %d", deathIntervals)
+	}
+	again, err := sampler.ScoreIntervals(ctx, tframes, byFrame, sampler.DefaultDisagreementConfig())
+	if err != nil {
+		t.Fatalf("ScoreIntervals: %v", err)
+	}
+	if !reflect.DeepEqual(scores, again) {
+		t.Fatalf("scorer nondeterministic")
+	}
+	t.Logf("disagreement flow: %d coarse frames -> %d intervals, death captured", len(frames), len(scores))
 }
