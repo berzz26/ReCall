@@ -253,7 +253,14 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	go worker.Start(workerCtx)
 
+	// Fiber's default BodyLimit is 4 MiB, which rejects any real video upload
+	// with 413 (the web dev proxy surfaces the reset connection as
+	// ECONNRESET). Derive the HTTP body cap from the configured max upload
+	// size plus headroom for multipart framing; the service layer still
+	// enforces MaxUploadSize on the file bytes themselves.
+	bodyLimit := int(cfg.MaxUploadSize) + (32 << 20)
 	app := fiber.New(fiber.Config{
+		BodyLimit: bodyLimit,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
@@ -283,7 +290,7 @@ func main() {
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
-	v1.Mount("/videos", videoHandler.SetupRoutes())
+	v1.Mount("/videos", videoHandler.SetupRoutes(bodyLimit))
 	v1.Get("/videos/:id/media", detailHandler.GetMedia)
 	v1.Get("/videos/:id/stream", videoStreamHandler.Stream)
 	v1.Get("/videos/:id/segments", detailHandler.GetSegments)
