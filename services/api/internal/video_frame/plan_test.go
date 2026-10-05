@@ -297,3 +297,50 @@ func TestGenerateForVideoUsesBaselinePlan(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractAdditionalSkipsExisting verifies additive midpoint extraction:
+// existing timestamps are not re-decoded, FrameIndex/storage keys continue,
+// and duplicates within the request are collapsed.
+func TestExtractAdditionalSkipsExisting(t *testing.T) {
+	const duration = 10.0
+	fx := newPlanFixture(t, duration)
+	ctx := context.Background()
+
+	budget, err := sampler.BaselineBudget(duration, 2*time.Second, 1.0)
+	if err != nil {
+		t.Fatalf("budget: %v", err)
+	}
+	plan := sampler.PlanWithTimestamps(fx.vid.ID, duration, []float64{0, 4, 8}, sampler.ReasonCoarse, budget)
+	if _, err := fx.svc.GenerateForVideoWithPlan(ctx, fx.vid, fx.segments, plan, 1280, 720); err != nil {
+		t.Fatalf("GenerateForVideoWithPlan: %v", err)
+	}
+	*fx.calls = nil // reset decoder call recording
+
+	added, err := fx.svc.ExtractAdditional(ctx, fx.vid, fx.segments, []float64{2, 4, 4.0, 6}, duration, 1280, 720)
+	if err != nil {
+		t.Fatalf("ExtractAdditional: %v", err)
+	}
+	if len(added) != 2 {
+		t.Fatalf("want 2 new frames (2 and 6), got %d", len(added))
+	}
+	if len(*fx.calls) != 2 || (*fx.calls)[0] != 2 || (*fx.calls)[1] != 6 {
+		t.Fatalf("decoder must run only for new timestamps, got %v", *fx.calls)
+	}
+	if added[0].FrameIndex != 3 || added[1].FrameIndex != 4 {
+		t.Fatalf("FrameIndex must continue after existing: %+v", added)
+	}
+	all, err := fx.svc.GetByVideoID(ctx, fx.vid.ID)
+	if err != nil {
+		t.Fatalf("GetByVideoID: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("want 5 total frames, got %d", len(all))
+	}
+	keys := map[string]bool{}
+	for _, f := range all {
+		if keys[f.StorageKey] {
+			t.Fatalf("duplicate storage key %s", f.StorageKey)
+		}
+		keys[f.StorageKey] = true
+	}
+}

@@ -35,6 +35,10 @@ type Config struct {
 	CoarseMaxGap           time.Duration
 	CoarseFKeep            float64
 	SamplerPlanTimeout     time.Duration
+	SamplerGamma           float64
+	SamplerMinGap          time.Duration
+	SamplerEpsilon         float64
+	SamplerMaxRounds       int
 	FFmpegPath             string
 	FFmpegTimeout          time.Duration
 	FrameJPEGQuality       int
@@ -268,6 +272,46 @@ func Load() Config {
 		} else {
 			panic(fmt.Sprintf("invalid SAMPLER_PLAN_TIMEOUT %q", v))
 		}
+	}
+
+	// Phase 4 refinement: priority = max(disagreement, gamma*probe_rank)*gap.
+	samplerGamma := 0.5
+	if v := os.Getenv("SAMPLER_GAMMA"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_GAMMA %q: must be >= 0", v))
+		}
+		samplerGamma = parsed
+	}
+
+	samplerMinGap := 500 * time.Millisecond
+	if v := os.Getenv("SAMPLER_MIN_GAP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("SAMPLER_MIN_GAP must be > 0, got %s", v))
+			}
+			samplerMinGap = d
+		} else {
+			panic(fmt.Sprintf("invalid SAMPLER_MIN_GAP %q: %v", v, err))
+		}
+	}
+
+	samplerEpsilon := 0.1
+	if v := os.Getenv("SAMPLER_EPSILON"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_EPSILON %q: must be >= 0", v))
+		}
+		samplerEpsilon = parsed
+	}
+
+	samplerMaxRounds := 4
+	if v := os.Getenv("SAMPLER_MAX_ROUNDS"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_MAX_ROUNDS %q: must be > 0", v))
+		}
+		samplerMaxRounds = parsed
 	}
 
 	ffmpegTimeout := 60 * time.Second
@@ -647,6 +691,10 @@ func Load() Config {
 		CoarseMaxGap:           coarseMaxGap,
 		CoarseFKeep:            coarseFKeep,
 		SamplerPlanTimeout:     samplerPlanTimeout,
+		SamplerGamma:           samplerGamma,
+		SamplerMinGap:          samplerMinGap,
+		SamplerEpsilon:         samplerEpsilon,
+		SamplerMaxRounds:       samplerMaxRounds,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,

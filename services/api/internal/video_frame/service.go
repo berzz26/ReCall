@@ -465,10 +465,125 @@ func extractSingleFrame(ctx context.Context, ffmpegPath, videoPath string, times
 	return data, nil
 }
 
+// ExtractAdditional extracts extra timestamps WITHOUT deleting existing
+// frames, for adaptive refinement rounds. Timestamps are normalized
+// (sorted, deduplicated, range-checked); already-extracted timestamps are
+// skipped so no frame is ever processed twice. FrameIndex and storage keys
+// continue after the existing frames. Unlike GenerateForVideoWithPlan it
+// applies no budget cap: the refinement planner owns budget accounting.
+func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, timestamps []float64, durationSeconds float64, width, height int) ([]VideoFrame, error) {
+	if s.storage == nil {
+		return nil, fmt.Errorf("storage not configured")
+	}
+	if len(segments) == 0 {
+		return nil, fmt.Errorf("no segments available for frame association")
+	}
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions")
+	}
+	want := sampler.NormalizeTimestamps(timestamps, durationSeconds)
+	if len(want) == 0 {
+		return []VideoFrame{}, nil
+	}
+
+	existing, err := s.repo.GetByVideoID(ctx, v.ID)
+	if err != nil {
+		return nil, err
+	}
+	done := make(map[float64]bool, len(existing))
+	base := 0
+	for _, f := range existing {
+		done[f.TimestampSeconds] = true
+		if f.FrameIndex >= base {
+			base = f.FrameIndex + 1
+		}
+	}
+	var fresh []float64
+	for _, t := range want {
+		dup := false
+		for dt := range done {
+			if dt-t < 1e-6 && t-dt < 1e-6 {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			fresh = append(fresh, t)
+			done[t] = true
+		}
+	}
+	if len(fresh) == 0 {
+		return []VideoFrame{}, nil
+	}
+
+	videoPath, cleanupVideo, err := s.resolveVideoPath(ctx, v)
+	if err != nil {
+		return nil, err
+	}
+	if cleanupVideo != nil {
+		defer cleanupVideo()
+	}
+
+	var createdKeys []string
+	var batch []VideoFrame
+	cleanupOnFail := func() {
+		for _, k := range createdKeys {
+			_ = s.storage.Delete(ctx, k)
+		}
+	}
+	for i, ts := range fresh {
+		if err := ctx.Err(); err != nil {
+			cleanupOnFail()
+			return nil, err
+		}
+		seg := FindSegment(segments, ts)
+		if seg == nil {
+			cleanupOnFail()
+			return nil, fmt.Errorf("no segment for timestamp %f", ts)
+		}
+		jpegBytes, err := s.extractOne(ctx, s.ffmpegPath, videoPath, ts, s.jpegQuality)
+		if err != nil {
+			cleanupOnFail()
+			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
+		}
+		fw, fh := width, height
+		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
+			fw = cfg.Width
+			fh = cfg.Height
+		}
+		key := frameStorageKey(v.ID, base+i)
+		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
+			cleanupOnFail()
+			return nil, fmt.Errorf("failed to store frame at %f: %w", ts, err)
+		}
+		createdKeys = append(createdKeys, key)
+		batch = append(batch, VideoFrame{
+			VideoID:          v.ID,
+			SegmentID:        seg.ID,
+			FrameIndex:       base + i,
+			TimestampSeconds: ts,
+			StorageKey:       key,
+			Width:            fw,
+			Height:           fh,
+		})
+	}
+	saved, err := s.repo.CreateBatch(ctx, batch)
+	if err != nil {
+		cleanupOnFail()
+		return nil, fmt.Errorf("failed to persist frames: %w", err)
+	}
+	slog.Info("frame: additional extraction complete",
+		"video_id", v.ID.String(),
+		"requested", len(want),
+		"extracted", len(saved),
+		"skipped_existing", len(want)-len(fresh),
+	)
+	return saved, nil
+}
+
 func (s *Service) GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error) {
 	return s.repo.GetByVideoID(ctx, videoID)
 }
-
 func (s *Service) DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error {
 	frames, err := s.repo.GetByVideoID(ctx, videoID)
 	if err != nil {
