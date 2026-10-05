@@ -48,6 +48,14 @@ const (
 	DefaultRefineEpsilon = 0.1
 	// DefaultRefineMaxRounds bounds the best-first loop.
 	DefaultRefineMaxRounds = 4
+	// DefaultProbeActivityFloor is the near-static guard: interval probe
+	// activity below this ChangedFraction is treated as zero before rank
+	// normalization. ChangedFraction counts changed 8x8 blocks out of 64,
+	// so 0.03 (~2 blocks) neutralizes isolated single-block sensor flicker
+	// (1/64 ≈ 0.0156) that would otherwise rank 1 and drive refinement on
+	// effectively static footage. Genuine motion spans many blocks and is
+	// unaffected. Deliberately conservative; tune upward to harden further.
+	DefaultProbeActivityFloor = 0.03
 )
 
 // RefinementConfig configures the refinement planner. Zero values fall back
@@ -61,6 +69,10 @@ type RefinementConfig struct {
 	Epsilon float64
 	// MaxRounds bounds the refinement loop.
 	MaxRounds int
+	// ActivityFloor zeroes interval probe activity below this ChangedFraction
+	// before rank normalization (near-static guard). Zero disables it,
+	// preserving exact Phase 4 behavior.
+	ActivityFloor float64
 	// Disagreement configures the Phase 3 throwaway scorer reused each round.
 	Disagreement DisagreementConfig
 }
@@ -88,6 +100,9 @@ func (c RefinementConfig) sanitized() RefinementConfig {
 	}
 	if c.MaxRounds <= 0 {
 		c.MaxRounds = DefaultRefineMaxRounds
+	}
+	if math.IsNaN(c.ActivityFloor) || c.ActivityFloor < 0 {
+		c.ActivityFloor = 0
 	}
 	c.Disagreement = c.Disagreement.sanitized()
 	return c
@@ -133,7 +148,18 @@ func SortCandidates(cands []RefinementCandidate) {
 // ChangedFraction among probe points strictly inside the interval
 // (start < t <= end). If an interval saw significant visual change, its
 // prior can raise its refinement priority even when tracking is silent.
+// ProbeRankForIntervals rank-normalizes with no activity floor (exact Phase
+// 4 behavior). Production refinement passes ActivityFloor via
+// ProbeRankForIntervalsWithFloor.
 func ProbeRankForIntervals(probe *ProbeReport, starts, ends []float64) []float64 {
+	return ProbeRankForIntervalsWithFloor(probe, starts, ends, 0)
+}
+
+// ProbeRankForIntervalsWithFloor is ProbeRankForIntervals with a near-static
+// guard: per-interval peak activity below floor is treated as zero before
+// ranking, so isolated single-block flicker cannot rank 1 and trigger
+// refinement on effectively static footage.
+func ProbeRankForIntervalsWithFloor(probe *ProbeReport, starts, ends []float64, floor float64) []float64 {
 	n := len(starts)
 	ranks := make([]float64, n)
 	if n == 0 || probe == nil {
@@ -148,6 +174,9 @@ func ProbeRankForIntervals(probe *ProbeReport, starts, ends []float64) []float64
 					peak = p.ChangedFraction
 				}
 			}
+		}
+		if peak < floor {
+			peak = 0
 		}
 		activity[i] = peak
 	}
@@ -375,7 +404,7 @@ func (r *Refiner) Refine(ctx context.Context, in RefinementInput, detect DetectF
 		for i, s := range scores {
 			starts[i], ends[i] = s.StartTimestamp, s.EndTimestamp
 		}
-		ranks := ProbeRankForIntervals(in.Probe, starts, ends)
+		ranks := ProbeRankForIntervalsWithFloor(in.Probe, starts, ends, cfg.ActivityFloor)
 		cands := BuildCandidates(scores, ranks, cfg)
 		eligible := len(cands)
 		for _, c := range cands {

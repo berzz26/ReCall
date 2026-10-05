@@ -73,29 +73,6 @@ func main() {
 	videoFrameRepo := video_frame.NewRepository(db.DB)
 	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality).WithSamplerBeta(cfg.SamplerBeta)
 	slog.Info("frame sampler configured", "sample_interval", cfg.FrameSampleInterval.String(), "sampler_beta", cfg.SamplerBeta)
-	if cfg.SamplerAdaptive {
-		adaptiveCfg := sampler.AdaptiveConfig{
-			BaselineInterval: cfg.FrameSampleInterval,
-			Beta:             cfg.SamplerBeta,
-			ProbeFPS:         cfg.ProbeFPS,
-			ProbeSize:        cfg.ProbeSize,
-			ProbeGrid:        cfg.ProbeGrid,
-			NoiseK:           cfg.ProbeNoiseK,
-			CoarseInterval:   cfg.CoarseInterval,
-			MaxGap:           cfg.CoarseMaxGap,
-			FKeep:            cfg.CoarseFKeep,
-			FFmpegPath:       cfg.FFmpegPath,
-			PlanTimeout:      cfg.SamplerPlanTimeout,
-		}
-		videoFrameService.WithVideoPlanner(sampler.NewAdaptiveCoarsePlanner(adaptiveCfg))
-		slog.Info("adaptive coarse sampler enabled",
-			"probe_fps", cfg.ProbeFPS, "probe_size", cfg.ProbeSize, "probe_grid", cfg.ProbeGrid,
-			"noise_k", cfg.ProbeNoiseK, "f_keep", cfg.CoarseFKeep,
-			"g", cfg.CoarseInterval.String(), "max_gap", cfg.CoarseMaxGap.String(),
-			"plan_timeout", cfg.SamplerPlanTimeout.String())
-	} else {
-		slog.Info("adaptive sampler disabled via SAMPLER_ADAPTIVE=false; using fixed baseline plan")
-	}
 
 	detectionRepo := detection.NewRepository(db.DB)
 	scriptPath := filepath.Join("workers", "detector", "detect.py")
@@ -207,6 +184,68 @@ func main() {
 
 	checkpointRepo := video_processing_checkpoint.NewRepository(db.DB)
 	processor := processing.NewFFprobeProcessorWithCheckpoints(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo)
+	if cfg.SamplerAdaptive {
+		// Phase 5 production boundary: probe → coarse/busy/refine →
+		// validated plan → extraction, with baseline fallbacks. Planning
+		// detections stay ephemeral; production YOLO runs once downstream
+		// over the final frame set. SAMPLER_ADAPTIVE=false (or shadow)
+		// keeps baseline frames authoritative.
+		adaptiveCfg := sampler.AdaptiveConfig{
+			BaselineInterval: cfg.FrameSampleInterval,
+			Beta:             cfg.SamplerBeta,
+			ProbeFPS:         cfg.ProbeFPS,
+			ProbeSize:        cfg.ProbeSize,
+			ProbeGrid:        cfg.ProbeGrid,
+			NoiseK:           cfg.ProbeNoiseK,
+			CoarseInterval:   cfg.CoarseInterval,
+			MaxGap:           cfg.CoarseMaxGap,
+			FKeep:            cfg.CoarseFKeep,
+			FFmpegPath:       cfg.FFmpegPath,
+			PlanTimeout:      cfg.SamplerPlanTimeout,
+		}
+		refineCfg := sampler.RefinementConfig{
+			Gamma:         cfg.SamplerGamma,
+			MinGapSeconds: cfg.SamplerMinGap.Seconds(),
+			Epsilon:       cfg.SamplerEpsilon,
+			MaxRounds:     cfg.SamplerMaxRounds,
+			ActivityFloor: sampler.DefaultProbeActivityFloor,
+			Disagreement: sampler.DisagreementConfig{
+				HighThreshold:  cfg.TrackerHighThreshold,
+				LowThreshold:   cfg.TrackerLowThreshold,
+				MatchThreshold: cfg.TrackerMatchThreshold,
+				FuseScore:      cfg.TrackerFuseScore,
+			},
+		}
+		orchestrator, err := processing.NewAdaptiveSampler(
+			videoFrameService,
+			visualService,
+			sampler.NewAdaptiveCoarsePlanner(adaptiveCfg),
+			sampler.NewRefiner(refineCfg),
+			processing.AdaptiveSamplerConfig{
+				Busy:             sampler.BusyConfig{Threshold: cfg.SamplerBusyThreshold, Fraction: cfg.SamplerBusyFraction},
+				Timeout:          cfg.SamplerPlanTimeout,
+				Shadow:           cfg.SamplerShadow,
+				BaselineInterval: cfg.FrameSampleInterval,
+				Beta:             cfg.SamplerBeta,
+			},
+		)
+		if err != nil {
+			slog.Error("failed to configure adaptive sampler", "error", err)
+			os.Exit(1)
+		}
+		processor.WithAdaptiveSampler(orchestrator)
+		slog.Info("adaptive sampler enabled",
+			"sampler_version", sampler.SamplerVersion,
+			"probe_fps", cfg.ProbeFPS, "probe_size", cfg.ProbeSize, "probe_grid", cfg.ProbeGrid,
+			"noise_k", cfg.ProbeNoiseK, "f_keep", cfg.CoarseFKeep,
+			"g", cfg.CoarseInterval.String(), "max_gap", cfg.CoarseMaxGap.String(),
+			"gamma", cfg.SamplerGamma, "min_gap", cfg.SamplerMinGap.String(),
+			"epsilon", cfg.SamplerEpsilon, "max_rounds", cfg.SamplerMaxRounds,
+			"busy_threshold", cfg.SamplerBusyThreshold, "busy_fraction", cfg.SamplerBusyFraction,
+			"plan_timeout", cfg.SamplerPlanTimeout.String(), "shadow", cfg.SamplerShadow)
+	} else {
+		slog.Info("adaptive sampler disabled via SAMPLER_ADAPTIVE=false; using fixed baseline plan")
+	}
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)

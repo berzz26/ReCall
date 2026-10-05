@@ -39,6 +39,9 @@ type Config struct {
 	SamplerMinGap          time.Duration
 	SamplerEpsilon         float64
 	SamplerMaxRounds       int
+	SamplerShadow          bool
+	SamplerBusyThreshold   float64
+	SamplerBusyFraction    float64
 	FFmpegPath             string
 	FFmpegTimeout          time.Duration
 	FrameJPEGQuality       int
@@ -312,6 +315,43 @@ func Load() Config {
 			panic(fmt.Sprintf("invalid SAMPLER_MAX_ROUNDS %q: must be > 0", v))
 		}
 		samplerMaxRounds = parsed
+	}
+
+	// Shadow mode: compute (but never apply) the adaptive plan. Baseline
+	// frames remain authoritative while adaptive statistics are logged.
+	// Conservative default off: shadow still pays for the visual probe.
+	samplerShadow := false
+	if v := os.Getenv("SAMPLER_SHADOW"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			samplerShadow = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			samplerShadow = false
+		default:
+			panic(fmt.Sprintf("invalid SAMPLER_SHADOW %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	// Global-busy heuristic: fraction of probe points at/above
+	// SAMPLER_BUSY_THRESHOLD ChangedFraction marking the video busy.
+	// ChangedFraction is changed 8x8 blocks out of 64, so 0.25 matches the
+	// F_KEEP activity scale; 0.6 requires most of the timeline active.
+	samplerBusyThreshold := 0.25
+	if v := os.Getenv("SAMPLER_BUSY_THRESHOLD"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_BUSY_THRESHOLD %q: must be >= 0", v))
+		}
+		samplerBusyThreshold = parsed
+	}
+
+	samplerBusyFraction := 0.6
+	if v := os.Getenv("SAMPLER_BUSY_FRACTION"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 || parsed > 1 {
+			panic(fmt.Sprintf("invalid SAMPLER_BUSY_FRACTION %q: must be 0..1", v))
+		}
+		samplerBusyFraction = parsed
 	}
 
 	ffmpegTimeout := 60 * time.Second
@@ -695,6 +735,9 @@ func Load() Config {
 		SamplerMinGap:          samplerMinGap,
 		SamplerEpsilon:         samplerEpsilon,
 		SamplerMaxRounds:       samplerMaxRounds,
+		SamplerShadow:          samplerShadow,
+		SamplerBusyThreshold:   samplerBusyThreshold,
+		SamplerBusyFraction:    samplerBusyFraction,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,

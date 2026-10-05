@@ -482,7 +482,7 @@ export default function VideoDetail() {
                           <div key={d.id} style={{ padding: 12, background: '#f8f9f8', border: '1px solid var(--border)', borderRadius: 8, cursor: seg ? 'pointer' : 'default' }} onClick={() => { if (!seg) return; seekTo(seg.start_time); setActiveTab('segments'); const el = document.getElementById(`seg-row-${seg.id}`); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }) }} title={seg ? `Click to play from ${formatDur(seg.start_time)}` : undefined}>
                             <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{timeLabel} — Segment {seg?.segment_index ?? '?'} • {seg ? formatDur(seg.start_time) : ''} ▶</div>
                             <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap', color: 'var(--text)' }}>{d.description}</div>
-                            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>Model: {d.model_name} v{d.model_version}</div>
+                            <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>Model: {d.model_name} </div>
                           </div>
                         )
                       })}

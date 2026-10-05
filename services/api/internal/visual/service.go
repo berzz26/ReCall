@@ -12,6 +12,7 @@ import (
 	"github.com/berzz26/recall/services/api/internal/detection"
 	"github.com/berzz26/recall/services/api/internal/detector"
 	"github.com/berzz26/recall/services/api/internal/storage"
+	"github.com/berzz26/recall/services/api/internal/tracker"
 	"github.com/berzz26/recall/services/api/internal/video_frame"
 	"github.com/google/uuid"
 )
@@ -306,6 +307,146 @@ func (s *Service) AnalyzeSegmentWithSession(ctx context.Context, videoID, segmen
 		return nil, fmt.Errorf("analyzer not configured")
 	}
 	return s.analyzeFramesWithSession(ctx, videoID, frames, sess)
+}
+
+// DetectFrames runs planning-only detection over exactly the given frames
+// and returns tracker-ready inputs WITHOUT persisting anything. Used by the
+// adaptive sampler's refinement loop: planning detections are ephemeral
+// (in-memory) and must never be confused with production detections, which
+// the pipeline's visual stage produces separately over the final frame set.
+// Filtering (13-class whitelist, confidence threshold, bbox clamp) mirrors
+// analyzeFramesWithSessionInternal exactly so planning judgments match what
+// production YOLO will report for the same frames.
+func (s *Service) DetectFrames(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame) ([]tracker.DetectionInput, error) {
+	detectStart := time.Now()
+	if len(frames) == 0 {
+		return []tracker.DetectionInput{}, nil
+	}
+	if s.analyzer == nil {
+		return nil, fmt.Errorf("analyzer not configured")
+	}
+	batchSize := s.batchSize
+	if batchSize <= 0 {
+		batchSize = 16
+	}
+
+	var sess *detector.Session
+	var useSession bool
+	if yolo, ok := s.analyzer.(*detector.YoloDetector); ok {
+		var err error
+		sess, err = yolo.NewSession(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("create detector session: %w", err)
+		}
+		useSession = true
+		defer func() {
+			if cerr := sess.Close(); cerr != nil {
+				slog.Warn("visual: failed to close planning detector session", "video_id", videoID.String(), "error", cerr)
+			}
+		}()
+	}
+
+	var out []tracker.DetectionInput
+	for start := 0; start < len(frames); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := start + batchSize
+		if end > len(frames) {
+			end = len(frames)
+		}
+		batchFrames := frames[start:end]
+
+		var tmps []string
+		var inputs []detector.FrameInput
+		cleanup := func() {
+			for _, p := range tmps {
+				_ = os.Remove(p)
+			}
+		}
+		failed := false
+		var matErr error
+		for _, f := range batchFrames {
+			rc, err := s.storage.Open(ctx, f.StorageKey)
+			if err != nil {
+				matErr = fmt.Errorf("open frame %s: %w", f.ID, err)
+				failed = true
+				break
+			}
+			ext := filepath.Ext(f.StorageKey)
+			if ext == "" {
+				ext = ".jpg"
+			}
+			tmp, err := os.CreateTemp("", "visual-plan-*"+ext)
+			if err != nil {
+				rc.Close()
+				matErr = err
+				failed = true
+				break
+			}
+			if _, err := io.Copy(tmp, rc); err != nil {
+				tmp.Close()
+				rc.Close()
+				_ = os.Remove(tmp.Name())
+				matErr = fmt.Errorf("copy frame %s: %w", f.ID, err)
+				failed = true
+				break
+			}
+			tmp.Close()
+			rc.Close()
+			tmps = append(tmps, tmp.Name())
+			inputs = append(inputs, detector.FrameInput{
+				FrameID: f.ID, VideoID: f.VideoID, SegmentID: f.SegmentID, Timestamp: f.TimestampSeconds, Width: f.Width, Height: f.Height, StorageKey: f.StorageKey, LocalPath: tmp.Name(),
+			})
+		}
+		if failed {
+			cleanup()
+			return nil, matErr
+		}
+		var results map[uuid.UUID][]detector.DetectionResult
+		var err error
+		if useSession {
+			results, err = sess.AnalyzeBatch(ctx, inputs)
+		} else {
+			results, err = s.analyzer.AnalyzeBatch(ctx, inputs)
+		}
+		cleanup()
+		if err != nil {
+			return nil, fmt.Errorf("planning analyze batch: %w", err)
+		}
+		for _, f := range batchFrames {
+			for _, r := range results[f.ID] {
+				if r.Label == "" {
+					continue
+				}
+				if _, ok := allowedClasses[r.Label]; !ok {
+					continue
+				}
+				if r.Confidence < s.threshold {
+					continue
+				}
+				x, y, w, h := detection.ClampBBox(r.BBoxX, r.BBoxY, r.BBoxWidth, r.BBoxHeight)
+				if w <= 0 || h <= 0 {
+					continue
+				}
+				if r.Confidence < 0 || r.Confidence > 1 {
+					continue
+				}
+				out = append(out, tracker.DetectionInput{
+					ID: uuid.New(), Label: r.Label, Confidence: r.Confidence,
+					BBoxX: x, BBoxY: y, BBoxWidth: w, BBoxHeight: h,
+					FrameID: f.ID, Timestamp: f.TimestampSeconds,
+				})
+			}
+		}
+	}
+	slog.Info("visual: planning detection complete (ephemeral, not persisted)",
+		"video_id", videoID.String(),
+		"frames", len(frames),
+		"detections", len(out),
+		"duration_ms", time.Since(detectStart).Milliseconds(),
+	)
+	return out, nil
 }
 
 func (s *Service) analyzeFrames(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame) ([]detection.Detection, error) {

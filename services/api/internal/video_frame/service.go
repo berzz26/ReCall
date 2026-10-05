@@ -370,6 +370,14 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 
 // resolveVideoPath maps a video to a local file path, downloading uploaded
 // videos to a temp file once per batch. The caller runs cleanup when done.
+//
+// ResolveVideoPath exposes resolveVideoPath for the adaptive-sampling
+// orchestrator, which needs the concrete file path for the visual probe.
+// Caller runs the returned cleanup when done (nil when no temp file).
+func (s *Service) ResolveVideoPath(ctx context.Context, v *video.Video) (string, func(), error) {
+	return s.resolveVideoPath(ctx, v)
+}
+
 func (s *Service) resolveVideoPath(ctx context.Context, v *video.Video) (string, func(), error) {
 	if v.SourceType == video.SourceTypeLocal {
 		if v.SourcePath == nil || *v.SourcePath == "" {
