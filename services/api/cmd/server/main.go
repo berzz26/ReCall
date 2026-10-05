@@ -261,6 +261,15 @@ func main() {
 	bodyLimit := int(cfg.MaxUploadSize) + (32 << 20)
 	app := fiber.New(fiber.Config{
 		BodyLimit: bodyLimit,
+		// Stream request bodies instead of buffering them in RAM: the upload
+		// handler reads the multipart file part as a stream straight to disk.
+		// DisablePreParseMultipartForm is required so fasthttp does not parse
+		// multipart itself (which would leave BodyStream() nil); the handler
+		// parses the stream with multipart.Reader instead. Other endpoints
+		// use small JSON bodies, which Body()/BodyParser still read on demand.
+		// (BodyLimit is still enforced by fasthttp while streaming.)
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
