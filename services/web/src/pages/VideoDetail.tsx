@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { client } from '../api/client'
+import { useDialog } from '../components/Dialog'
 import type { Video, MediaMetadata, Segment, Frame, Detection, Track, Event, SegmentDescription } from '../api/types'
 
 function formatDur(sec: number) {
@@ -38,6 +39,7 @@ export default function VideoDetail() {
   const [pvResults, setPvResults] = useState<any[] | null>(null)
   const [pvLoading, setPvLoading] = useState(false)
   const [pvError, setPvError] = useState<string | null>(null)
+  const { confirm, notify } = useDialog()
   const [filterSegmentId, setFilterSegmentId] = useState<string | null>(null)
 
   const fetchAll = async () => {
@@ -103,8 +105,14 @@ export default function VideoDetail() {
 
   const onDelete = async () => {
     if (!video) return
-    if (!confirm(`Delete video "${video.filename}"? This will permanently delete the video and all its frames, tracks and metadata. This cannot be undone.`)) return
-    try { await client.del(`/api/v1/videos/${video.id}`); navigate('/videos') } catch (e: any) { alert(`Delete failed: ${e.message}`) }
+    const ok = await confirm({
+      title: 'Delete video',
+      message: `Delete "${video.filename}"? This will permanently delete the video and all its frames, tracks and metadata. This cannot be undone.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
+    try { await client.del(`/api/v1/videos/${video.id}`); navigate('/videos') } catch (e: any) { await notify({ title: 'Delete failed', message: e.message }) }
   }
 
   const seekTo = (sec: number) => {

@@ -1,6 +1,7 @@
 import { useEffect, useState, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { client } from '../api/client'
+import { useDialog } from '../components/Dialog'
 import type { Video, MediaMetadata, Segment } from '../api/types'
 
 export default function Videos() {
@@ -13,6 +14,7 @@ export default function Videos() {
   const [sort, setSort] = useState('newest')
   const [uploading, setUploading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const { confirm, notify } = useDialog()
 
   const fetchAll = async () => {
     try {
@@ -45,12 +47,18 @@ export default function Videos() {
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]; if (!f) return
     setUploading(true)
-    try { await client.upload('/api/v1/videos/', f); await fetchAll() } catch (err: any) { alert(err.message) } finally { setUploading(false); e.target.value = '' }
+    try { await client.upload('/api/v1/videos/', f); await fetchAll() } catch (err: any) { await notify({ title: 'Upload failed', message: err.message }) } finally { setUploading(false); e.target.value = '' }
   }
 
   const onDelete = async (id: string, filename: string) => {
-    if (!confirm(`Delete video "${filename}"? This will permanently delete the video and all its frames, tracks and metadata.`)) return
-    try { await client.del(`/api/v1/videos/${id}`); setVideos(prev => prev.filter(v => v.id !== id)) } catch (e: any) { alert(`Delete failed: ${e.message}`) }
+    const ok = await confirm({
+      title: 'Delete video',
+      message: `Delete "${filename}"? This will permanently delete the video and all its frames, tracks and metadata.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
+    try { await client.del(`/api/v1/videos/${id}`); setVideos(prev => prev.filter(v => v.id !== id)) } catch (e: any) { await notify({ title: 'Delete failed', message: e.message }) }
   }
 
   const filtered = useMemo(() => {
