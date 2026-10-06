@@ -18,6 +18,7 @@ import (
 	"github.com/berzz26/recall/services/api/internal/health"
 	local_source "github.com/berzz26/recall/services/api/internal/local_source"
 	"github.com/berzz26/recall/services/api/internal/processing"
+	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/search"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
@@ -27,8 +28,8 @@ import (
 	"github.com/berzz26/recall/services/api/internal/video_event"
 	"github.com/berzz26/recall/services/api/internal/video_frame"
 	"github.com/berzz26/recall/services/api/internal/video_media"
-	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_processing_checkpoint"
+	"github.com/berzz26/recall/services/api/internal/video_segment"
 	"github.com/berzz26/recall/services/api/internal/video_track"
 	"github.com/berzz26/recall/services/api/internal/vision"
 	"github.com/berzz26/recall/services/api/internal/visual"
@@ -70,7 +71,8 @@ func main() {
 	videoSegmentService := video_segment.NewService(videoSegmentRepo, cfg.SegmentDuration)
 
 	videoFrameRepo := video_frame.NewRepository(db.DB)
-	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality)
+	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality).WithSamplerBeta(cfg.SamplerBeta).WithExtractWorkers(cfg.ExtractWorkers)
+	slog.Info("frame sampler configured", "sample_interval", cfg.FrameSampleInterval.String(), "sampler_beta", cfg.SamplerBeta)
 
 	detectionRepo := detection.NewRepository(db.DB)
 	scriptPath := filepath.Join("workers", "detector", "detect.py")
@@ -182,6 +184,68 @@ func main() {
 
 	checkpointRepo := video_processing_checkpoint.NewRepository(db.DB)
 	processor := processing.NewFFprobeProcessorWithCheckpoints(cfg.FFprobePath, cfg.FFprobeTimeout, store, videoMediaService, videoSegmentService, videoFrameService, visualService, trackService, eventService, segmentDescService, embedServiceForPipeline, checkpointRepo)
+	if cfg.SamplerAdaptive {
+		// Phase 5 production boundary: probe → coarse/busy/refine →
+		// validated plan → extraction, with baseline fallbacks. Planning
+		// detections stay ephemeral; production YOLO runs once downstream
+		// over the final frame set. SAMPLER_ADAPTIVE=false (or shadow)
+		// keeps baseline frames authoritative.
+		adaptiveCfg := sampler.AdaptiveConfig{
+			BaselineInterval: cfg.FrameSampleInterval,
+			Beta:             cfg.SamplerBeta,
+			ProbeFPS:         cfg.ProbeFPS,
+			ProbeSize:        cfg.ProbeSize,
+			ProbeGrid:        cfg.ProbeGrid,
+			NoiseK:           cfg.ProbeNoiseK,
+			CoarseInterval:   cfg.CoarseInterval,
+			MaxGap:           cfg.CoarseMaxGap,
+			FKeep:            cfg.CoarseFKeep,
+			FFmpegPath:       cfg.FFmpegPath,
+			PlanTimeout:      cfg.SamplerPlanTimeout,
+		}
+		refineCfg := sampler.RefinementConfig{
+			Gamma:         cfg.SamplerGamma,
+			MinGapSeconds: cfg.SamplerMinGap.Seconds(),
+			Epsilon:       cfg.SamplerEpsilon,
+			MaxRounds:     cfg.SamplerMaxRounds,
+			ActivityFloor: sampler.DefaultProbeActivityFloor,
+			Disagreement: sampler.DisagreementConfig{
+				HighThreshold:  cfg.TrackerHighThreshold,
+				LowThreshold:   cfg.TrackerLowThreshold,
+				MatchThreshold: cfg.TrackerMatchThreshold,
+				FuseScore:      cfg.TrackerFuseScore,
+			},
+		}
+		orchestrator, err := processing.NewAdaptiveSampler(
+			videoFrameService,
+			visualService,
+			sampler.NewAdaptiveCoarsePlanner(adaptiveCfg),
+			sampler.NewRefiner(refineCfg),
+			processing.AdaptiveSamplerConfig{
+				Busy:             sampler.BusyConfig{Threshold: cfg.SamplerBusyThreshold, Fraction: cfg.SamplerBusyFraction},
+				Timeout:          cfg.SamplerPlanTimeout,
+				Shadow:           cfg.SamplerShadow,
+				BaselineInterval: cfg.FrameSampleInterval,
+				Beta:             cfg.SamplerBeta,
+			},
+		)
+		if err != nil {
+			slog.Error("failed to configure adaptive sampler", "error", err)
+			os.Exit(1)
+		}
+		processor.WithAdaptiveSampler(orchestrator)
+		slog.Info("adaptive sampler enabled",
+			"sampler_version", sampler.SamplerVersion,
+			"probe_fps", cfg.ProbeFPS, "probe_size", cfg.ProbeSize, "probe_grid", cfg.ProbeGrid,
+			"noise_k", cfg.ProbeNoiseK, "f_keep", cfg.CoarseFKeep,
+			"g", cfg.CoarseInterval.String(), "max_gap", cfg.CoarseMaxGap.String(),
+			"gamma", cfg.SamplerGamma, "min_gap", cfg.SamplerMinGap.String(),
+			"epsilon", cfg.SamplerEpsilon, "max_rounds", cfg.SamplerMaxRounds,
+			"busy_threshold", cfg.SamplerBusyThreshold, "busy_fraction", cfg.SamplerBusyFraction,
+			"plan_timeout", cfg.SamplerPlanTimeout.String(), "shadow", cfg.SamplerShadow)
+	} else {
+		slog.Info("adaptive sampler disabled via SAMPLER_ADAPTIVE=false; using fixed baseline plan")
+	}
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)
@@ -189,7 +253,23 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	go worker.Start(workerCtx)
 
+	// Fiber's default BodyLimit is 4 MiB, which rejects any real video upload
+	// with 413 (the web dev proxy surfaces the reset connection as
+	// ECONNRESET). Derive the HTTP body cap from the configured max upload
+	// size plus headroom for multipart framing; the service layer still
+	// enforces MaxUploadSize on the file bytes themselves.
+	bodyLimit := int(cfg.MaxUploadSize) + (32 << 20)
 	app := fiber.New(fiber.Config{
+		BodyLimit: bodyLimit,
+		// Stream request bodies instead of buffering them in RAM: the upload
+		// handler reads the multipart file part as a stream straight to disk.
+		// DisablePreParseMultipartForm is required so fasthttp does not parse
+		// multipart itself (which would leave BodyStream() nil); the handler
+		// parses the stream with multipart.Reader instead. Other endpoints
+		// use small JSON bodies, which Body()/BodyParser still read on demand.
+		// (BodyLimit is still enforced by fasthttp while streaming.)
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
@@ -201,10 +281,10 @@ func main() {
 
 	app.Use(recover.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "*",
+		AllowOrigins:  "*",
+		AllowHeaders:  "*",
 		ExposeHeaders: "Content-Range, Accept-Ranges, Content-Length, Content-Type",
-		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowMethods:  "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
 	if cfg.Env == "development" {
 		app.Use(logger.New(logger.Config{
@@ -219,7 +299,7 @@ func main() {
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
-	v1.Mount("/videos", videoHandler.SetupRoutes())
+	v1.Mount("/videos", videoHandler.SetupRoutes(bodyLimit))
 	v1.Get("/videos/:id/media", detailHandler.GetMedia)
 	v1.Get("/videos/:id/stream", videoStreamHandler.Stream)
 	v1.Get("/videos/:id/segments", detailHandler.GetSegments)

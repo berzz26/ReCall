@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { DialogProvider } from './components/Dialog'
 import Videos from './pages/Videos'
 import VideoDetail from './pages/VideoDetail'
 import LocalSources from './pages/LocalSources'
@@ -8,6 +9,7 @@ import Search from './pages/Search'
 export default function App() {
   return (
     <BrowserRouter>
+      <DialogProvider>
       <Layout>
         <Routes>
           <Route path="/" element={<Navigate to="/videos" replace />} />
@@ -18,6 +20,7 @@ export default function App() {
           <Route path="/settings" element={<LocalSources />} />
         </Routes>
       </Layout>
+      </DialogProvider>
     </BrowserRouter>
   )
 }

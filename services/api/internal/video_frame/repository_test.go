@@ -151,3 +151,45 @@ func TestGetByVideoIDOrder(t *testing.T) {
 		t.Fatalf("ordering failed %v", list)
 	}
 }
+
+func TestGetByVideoIDChronologicalAfterRefinement(t *testing.T) {
+	// Refinement midpoints are appended with insertion-order FrameIndex
+	// values that do not match temporal order (e.g. coarse [0s, 10s] take
+	// indices 0,1, then midpoint 5s takes index 2). Reads must still come
+	// back in timestamp order.
+	repo, db := newTestRepo(t)
+	ctx := context.Background()
+	vid, segID := createVideoAndSegment(t, ctx, db)
+	defer video.NewRepository(db.DB).Delete(ctx, vid)
+
+	seed := []VideoFrame{
+		{VideoID: vid, SegmentID: segID, FrameIndex: 0, TimestampSeconds: 0, StorageKey: "videos/" + vid.String() + "/frames/000000.jpg", Width: 100, Height: 100},
+		{VideoID: vid, SegmentID: segID, FrameIndex: 1, TimestampSeconds: 10, StorageKey: "videos/" + vid.String() + "/frames/000001.jpg", Width: 100, Height: 100},
+		{VideoID: vid, SegmentID: segID, FrameIndex: 2, TimestampSeconds: 5, StorageKey: "videos/" + vid.String() + "/frames/000002.jpg", Width: 100, Height: 100},
+	}
+	if _, err := repo.CreateBatch(ctx, seed); err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	got, err := repo.GetByVideoID(ctx, vid)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	wantTs := []float64{0, 5, 10}
+	if len(got) != len(wantTs) {
+		t.Fatalf("expected %d got %d", len(wantTs), len(got))
+	}
+	for i, want := range wantTs {
+		if got[i].TimestampSeconds != want {
+			t.Fatalf("position %d: want ts %v got ts %v (index %d)", i, want, got[i].TimestampSeconds, got[i].FrameIndex)
+		}
+	}
+	segList, err := repo.GetBySegmentID(ctx, segID)
+	if err != nil {
+		t.Fatalf("GetBySegmentID: %v", err)
+	}
+	for i, want := range wantTs {
+		if segList[i].TimestampSeconds != want {
+			t.Fatalf("segment position %d: want ts %v got ts %v", i, want, segList[i].TimestampSeconds)
+		}
+	}
+}

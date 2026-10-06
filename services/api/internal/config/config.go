@@ -25,6 +25,23 @@ type Config struct {
 	FFprobeTimeout         time.Duration
 	SegmentDuration        time.Duration
 	FrameSampleInterval    time.Duration
+	SamplerBeta            float64
+	SamplerAdaptive        bool
+	ProbeFPS               float64
+	ProbeSize              int
+	ProbeGrid              int
+	ProbeNoiseK            float64
+	CoarseInterval         time.Duration
+	CoarseMaxGap           time.Duration
+	CoarseFKeep            float64
+	SamplerPlanTimeout     time.Duration
+	SamplerGamma           float64
+	SamplerMinGap          time.Duration
+	SamplerEpsilon         float64
+	SamplerMaxRounds       int
+	SamplerShadow          bool
+	SamplerBusyThreshold   float64
+	SamplerBusyFraction    float64
 	FFmpegPath             string
 	FFmpegTimeout          time.Duration
 	FrameJPEGQuality       int
@@ -34,6 +51,7 @@ type Config struct {
 	ModelPath              string
 	PythonPath             string
 	YOLOBatchSize          int
+	ExtractWorkers         int
 	EventMovementThreshold float64
 	VisionProvider         string
 	VisionPythonPath       string
@@ -150,6 +168,193 @@ func Load() Config {
 		ffmpegPath = "ffmpeg"
 	}
 
+	// Sampler budget scale: B = ceil(beta * N_baseline). Phase 1 uses 1.0,
+	// so the adaptive sampler never sends more than N_baseline frames to YOLO.
+	samplerBeta := 1.0
+	if v := os.Getenv("SAMPLER_BETA"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid SAMPLER_BETA %q: %v", v, err))
+		}
+		if parsed <= 0 {
+			panic(fmt.Sprintf("SAMPLER_BETA must be > 0, got %s", v))
+		}
+		samplerBeta = parsed
+	}
+
+	// Phase 2 adaptive coarse sampler: visual probe (5 FPS, 64x64 gray, 8x8
+	// grid) driving coarse/heartbeat selection within the baseline budget.
+	// SAMPLER_ADAPTIVE=false restores the fixed 2-second baseline plan.
+	samplerAdaptive := true
+	if v := os.Getenv("SAMPLER_ADAPTIVE"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			samplerAdaptive = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			samplerAdaptive = false
+		default:
+			panic(fmt.Sprintf("invalid SAMPLER_ADAPTIVE %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	probeFPS := 5.0
+	if v := os.Getenv("PROBE_FPS"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_FPS %q: must be > 0", v))
+		}
+		probeFPS = parsed
+	}
+
+	probeSize := 64
+	if v := os.Getenv("PROBE_SIZE"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_SIZE %q: must be > 0", v))
+		}
+		probeSize = parsed
+	}
+
+	probeGrid := 8
+	if v := os.Getenv("PROBE_GRID"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid PROBE_GRID %q: must be > 0", v))
+		}
+		probeGrid = parsed
+	}
+	if probeSize%probeGrid != 0 {
+		panic(fmt.Sprintf("PROBE_SIZE (%d) must be divisible by PROBE_GRID (%d)", probeSize, probeGrid))
+	}
+
+	probeNoiseK := 3.0
+	if v := os.Getenv("PROBE_NOISE_K"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid PROBE_NOISE_K %q: must be >= 0", v))
+		}
+		probeNoiseK = parsed
+	}
+
+	coarseInterval := 4 * time.Second
+	if v := os.Getenv("COARSE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("COARSE_INTERVAL must be > 0, got %s", v))
+			}
+			coarseInterval = d
+		} else {
+			panic(fmt.Sprintf("invalid COARSE_INTERVAL %q: %v", v, err))
+		}
+	}
+
+	coarseMaxGap := 10 * time.Second
+	if v := os.Getenv("COARSE_MAX_GAP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("COARSE_MAX_GAP must be > 0, got %s", v))
+			}
+			coarseMaxGap = d
+		} else {
+			panic(fmt.Sprintf("invalid COARSE_MAX_GAP %q: %v", v, err))
+		}
+	}
+
+	coarseFKeep := 0.25
+	if v := os.Getenv("COARSE_F_KEEP"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 || parsed > 1 {
+			panic(fmt.Sprintf("invalid COARSE_F_KEEP %q: must be 0..1", v))
+		}
+		coarseFKeep = parsed
+	}
+
+	samplerPlanTimeout := 5 * time.Minute
+	if v := os.Getenv("SAMPLER_PLAN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			samplerPlanTimeout = d
+		} else {
+			panic(fmt.Sprintf("invalid SAMPLER_PLAN_TIMEOUT %q", v))
+		}
+	}
+
+	// Phase 4 refinement: priority = max(disagreement, gamma*probe_rank)*gap.
+	samplerGamma := 0.5
+	if v := os.Getenv("SAMPLER_GAMMA"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_GAMMA %q: must be >= 0", v))
+		}
+		samplerGamma = parsed
+	}
+
+	samplerMinGap := 500 * time.Millisecond
+	if v := os.Getenv("SAMPLER_MIN_GAP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			if d <= 0 {
+				panic(fmt.Sprintf("SAMPLER_MIN_GAP must be > 0, got %s", v))
+			}
+			samplerMinGap = d
+		} else {
+			panic(fmt.Sprintf("invalid SAMPLER_MIN_GAP %q: %v", v, err))
+		}
+	}
+
+	samplerEpsilon := 0.1
+	if v := os.Getenv("SAMPLER_EPSILON"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_EPSILON %q: must be >= 0", v))
+		}
+		samplerEpsilon = parsed
+	}
+
+	samplerMaxRounds := 4
+	if v := os.Getenv("SAMPLER_MAX_ROUNDS"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || parsed <= 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_MAX_ROUNDS %q: must be > 0", v))
+		}
+		samplerMaxRounds = parsed
+	}
+
+	// Shadow mode: compute (but never apply) the adaptive plan. Baseline
+	// frames remain authoritative while adaptive statistics are logged.
+	// Conservative default off: shadow still pays for the visual probe.
+	samplerShadow := false
+	if v := os.Getenv("SAMPLER_SHADOW"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			samplerShadow = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			samplerShadow = false
+		default:
+			panic(fmt.Sprintf("invalid SAMPLER_SHADOW %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+
+	// Global-busy heuristic: fraction of probe points at/above
+	// SAMPLER_BUSY_THRESHOLD ChangedFraction marking the video busy.
+	// ChangedFraction is changed 8x8 blocks out of 64, so 0.25 matches the
+	// F_KEEP activity scale; 0.6 requires most of the timeline active.
+	samplerBusyThreshold := 0.25
+	if v := os.Getenv("SAMPLER_BUSY_THRESHOLD"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 {
+			panic(fmt.Sprintf("invalid SAMPLER_BUSY_THRESHOLD %q: must be >= 0", v))
+		}
+		samplerBusyThreshold = parsed
+	}
+
+	samplerBusyFraction := 0.6
+	if v := os.Getenv("SAMPLER_BUSY_FRACTION"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || parsed < 0 || parsed > 1 {
+			panic(fmt.Sprintf("invalid SAMPLER_BUSY_FRACTION %q: must be 0..1", v))
+		}
+		samplerBusyFraction = parsed
+	}
+
 	ffmpegTimeout := 60 * time.Second
 	if v := os.Getenv("FFMPEG_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -236,6 +441,19 @@ func Load() Config {
 			panic(fmt.Sprintf("YOLO_BATCH_SIZE must be > 0, got %s", v))
 		}
 		yoloBatchSize = parsed
+	}
+
+	// 0/auto = min(NumCPU, 8), resolved by the video_frame service.
+	extractWorkers := 0
+	if v := os.Getenv("FRAME_EXTRACT_WORKERS"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			panic(fmt.Sprintf("invalid FRAME_EXTRACT_WORKERS %q: %v", v, err))
+		}
+		if parsed <= 0 {
+			panic(fmt.Sprintf("FRAME_EXTRACT_WORKERS must be > 0, got %s", v))
+		}
+		extractWorkers = parsed
 	}
 
 	movementThreshold := 0.05
@@ -517,6 +735,23 @@ func Load() Config {
 		FFprobeTimeout:         ffprobeTimeout,
 		SegmentDuration:        segmentDuration,
 		FrameSampleInterval:    frameSampleInterval,
+		SamplerBeta:            samplerBeta,
+		SamplerAdaptive:        samplerAdaptive,
+		ProbeFPS:               probeFPS,
+		ProbeSize:              probeSize,
+		ProbeGrid:              probeGrid,
+		ProbeNoiseK:            probeNoiseK,
+		CoarseInterval:         coarseInterval,
+		CoarseMaxGap:           coarseMaxGap,
+		CoarseFKeep:            coarseFKeep,
+		SamplerPlanTimeout:     samplerPlanTimeout,
+		SamplerGamma:           samplerGamma,
+		SamplerMinGap:          samplerMinGap,
+		SamplerEpsilon:         samplerEpsilon,
+		SamplerMaxRounds:       samplerMaxRounds,
+		SamplerShadow:          samplerShadow,
+		SamplerBusyThreshold:   samplerBusyThreshold,
+		SamplerBusyFraction:    samplerBusyFraction,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,
@@ -526,6 +761,7 @@ func Load() Config {
 		ModelPath:              modelPath,
 		PythonPath:             pythonPath,
 		YOLOBatchSize:          yoloBatchSize,
+		ExtractWorkers:         extractWorkers,
 		EventMovementThreshold: movementThreshold,
 		VisionProvider:         visionProvider,
 		VisionPythonPath:       visionPythonPath,

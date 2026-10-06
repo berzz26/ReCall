@@ -145,3 +145,84 @@ func TestThresholdFiltering(t *testing.T) {
 		t.Fatalf("threshold should filter, got %d", len(saved))
 	}
 }
+
+// TestDetectFramesEphemeral verifies planning-only detection: same filtering
+// as production AnalyzeVideo, but nothing is persisted to the detection
+// table. DB-gated like the other visual tests.
+func TestDetectFramesEphemeral(t *testing.T) {
+	fake := &detector.FakeVisualAnalyzer{}
+	vs, frameSvc, segSvc, mediaSvc, db, store, dir := newTestVisualDeps(t, fake)
+	defer func() { db.Close(); os.RemoveAll(dir) }()
+	ctx := context.Background()
+	videoSvc := video.NewServiceWithConfig(video.NewRepository(db.DB), store, 1<<30)
+	v, err := videoSvc.CreateVideo(ctx, "ephemeral.mp4", func() *string { s := uuid.New().String(); return &s }(), func() *string { s := "video/mp4"; return &s }(), func() *int64 { i := int64(100); return &i }(), func() *video.SourceType { s := video.SourceTypeUpload; return &s }(), nil)
+	if err != nil {
+		t.Fatalf("CreateVideo: %v", err)
+	}
+	defer videoSvc.DeleteVideo(ctx, v.ID)
+	dur := 10.0
+	meta := &video_media.MediaMetadata{VideoID: v.ID, DurationSeconds: &dur}
+	video_media.NewRepository(db.DB).Upsert(ctx, meta)
+	segs, err := segSvc.GenerateForVideo(ctx, v.ID, 10)
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+	frameRepo := video_frame.NewRepository(db.DB)
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9}
+	var frames []video_frame.VideoFrame
+	for i := 0; i < 3; i++ {
+		ts := float64(i * 2)
+		seg := video_frame.FindSegment(segs, ts)
+		if seg == nil {
+			seg = &segs[0]
+		}
+		key := "videos/" + v.ID.String() + "/frames/eph000" + string(rune('0'+i)) + ".jpg"
+		if err := store.Save(ctx, key, bytes.NewReader(jpeg)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		frames = append(frames, video_frame.VideoFrame{VideoID: v.ID, SegmentID: seg.ID, FrameIndex: i, TimestampSeconds: ts, StorageKey: key, Width: 640, Height: 480})
+	}
+	if _, err := frameRepo.CreateBatch(ctx, frames); err != nil {
+		t.Fatalf("CreateBatch frames: %v", err)
+	}
+	defer func() {
+		vs.DeleteByVideoID(ctx, v.ID)
+		frameSvc.DeleteByVideoID(ctx, v.ID)
+		segSvc.DeleteByVideoID(ctx, v.ID)
+		mediaSvc.DeleteByVideoID(ctx, v.ID)
+	}()
+
+	got, err := vs.DetectFrames(ctx, v.ID, frames)
+	if err != nil {
+		t.Fatalf("DetectFrames: %v", err)
+	}
+	// Fake analyzer returns 2 detections per frame.
+	if len(got) != 6 {
+		t.Fatalf("expected 6 planning detections, got %d", len(got))
+	}
+	byFrame := map[uuid.UUID]int{}
+	for _, d := range got {
+		if d.ID == uuid.Nil {
+			t.Fatalf("planning detection needs fresh ID")
+		}
+		byFrame[d.FrameID]++
+	}
+	for _, f := range frames {
+		if byFrame[f.ID] != 2 {
+			t.Fatalf("frame %s: want 2 detections, got %d", f.ID, byFrame[f.ID])
+		}
+	}
+	// Nothing persisted: the detection table must stay empty.
+	stored, err := vs.GetByVideoID(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("GetByVideoID: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("planning detections must not persist, found %d", len(stored))
+	}
+	// Empty input is a no-op, not an error.
+	empty, err := vs.DetectFrames(ctx, v.ID, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty DetectFrames must return empty, got %v %v", empty, err)
+	}
+}

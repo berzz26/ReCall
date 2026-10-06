@@ -2,6 +2,9 @@ package video
 
 import (
 	"context"
+	"io"
+	"mime"
+	"mime/multipart"
 	"strings"
 	"time"
 
@@ -20,28 +23,64 @@ func NewHandler(service *Service) *Handler {
 func (h *Handler) Create(c *fiber.Ctx) error {
 	contentType := c.Get("Content-Type")
 	if strings.Contains(contentType, "multipart/form-data") {
-		file, err := c.FormFile("file")
+		// Stream the upload: with StreamRequestBody the body is not buffered
+		// in RAM, so read the file part via multipart.Reader and pipe it
+		// straight through UploadVideo -> storage (disk). Peak extra memory
+		// is a few KB regardless of file size.
+		_, params, err := mime.ParseMediaType(contentType)
 		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid multipart request"})
+		}
+		boundary := params["boundary"]
+		if boundary == "" {
+			if b := c.Request().Header.MultipartFormBoundary(); len(b) > 0 {
+				boundary = string(b)
+			} else {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing multipart boundary"})
+			}
+		}
+		mr := multipart.NewReader(c.Request().BodyStream(), boundary)
+		var filename, partMime string
+		var part io.Reader
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to read upload"})
+			}
+			if p.FormName() != "file" {
+				_, _ = io.Copy(io.Discard, p)
+				continue
+			}
+			filename = p.FileName()
+			partMime = p.Header.Get("Content-Type")
+			part = p
+			break
+		}
+		if part == nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "file is required"})
 		}
-		src, err := file.Open()
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to open file"})
+		if filename == "" {
+			filename = "upload.mp4"
 		}
-		defer src.Close()
-
-		mimeType := file.Header.Get("Content-Type")
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
+		if partMime == "" {
+			partMime = "application/octet-stream"
 		}
 
-		ctx, cancel := context.WithTimeout(c.UserContext(), 30*time.Second)
-		defer cancel()
-
-		v, err := h.service.UploadVideo(ctx, file.Filename, src, mimeType)
+		// Request-scoped context: no artificial timeout (network transfer
+		// time now counts, unlike the old buffered path). c.Context() is
+		// tied to the connection, so a client disconnect (e.g. pressing
+		// Cancel in the UI) cancels the copy to disk and lets the service
+		// clean up the partial upload instead of leaving a FAILED row.
+		v, err := h.service.UploadVideo(c.Context(), filename, part, partMime)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
+		// Drain the trailing boundary bytes so the connection can be reused
+		// (success path only: the file part was fully consumed).
+		_, _ = io.Copy(io.Discard, c.Request().BodyStream())
 		return c.Status(fiber.StatusCreated).JSON(v)
 	}
 

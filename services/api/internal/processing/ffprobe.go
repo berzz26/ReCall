@@ -42,6 +42,17 @@ type FFprobeProcessor struct {
 	descService    *segment_description.Service
 	embedService   *segment_embedding.Service
 	checkpointRepo *video_processing_checkpoint.Repository
+	// adaptiveSampler, when set, owns the entire frame-planning stage
+	// (probe → coarse/busy/refine → validated plan → extraction). Nil
+	// preserves the legacy baseline frame path exactly.
+	adaptiveSampler *AdaptiveSampler
+}
+
+// WithAdaptiveSampler installs the Phase 5 production adaptive boundary.
+// Nil (default) keeps the pre-adaptive frame path untouched.
+func (p *FFprobeProcessor) WithAdaptiveSampler(a *AdaptiveSampler) *FFprobeProcessor {
+	p.adaptiveSampler = a
+	return p
 }
 
 func NewFFprobeProcessor(ffprobePath string, timeout time.Duration, store storage.Storage, mediaService *video_media.Service) *FFprobeProcessor {
@@ -430,8 +441,27 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 			w = 1280
 			h = 720
 		}
-		// Checkpoint-aware frame extraction: skip if frames already exist for video (preserve completed segment frames)
-		if p.checkpointRepo != nil {
+		if p.adaptiveSampler != nil {
+			// Production adaptive boundary: probe → coarse/busy/refine →
+			// validated plan → extraction, with baseline fallbacks. The
+			// orchestrator owns resume-skip semantics for this path.
+			frameStart := time.Now()
+			_, stats, err := p.adaptiveSampler.PlanAndExtract(ctx, v, segments, *meta.DurationSeconds, w, h, videoPath, p.checkpointRepo != nil)
+			frameMs = time.Since(frameStart).Milliseconds()
+			if err != nil {
+				slog.Error("pipeline: adaptive sampling failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
+				return fmt.Errorf("failed adaptive sampling: %w", err)
+			}
+			slog.Info("pipeline: frame extraction complete (adaptive)",
+				"video_id", v.ID.String(), "duration_ms", frameMs,
+				"sampler_mode", stats.Mode, "sampler_version", stats.Version,
+				"final_frames", stats.FinalFrames, "baseline_frames", stats.BaselineFrames,
+				"estimated_savings", stats.EstimatedSavings,
+				"fallback_reason", stats.FallbackReason)
+			// Downstream stages consume frames/detections from storage as
+			// usual; they never see the plan object or the sampler mode.
+		} else if p.checkpointRepo != nil {
+			// Checkpoint-aware frame extraction: skip if frames already exist for video (preserve completed segment frames)
 			if existingFrames, err := p.frameService.GetByVideoID(ctx, v.ID); err == nil && len(existingFrames) > 0 {
 				slog.Info("pipeline: frame extraction skipped (frames already exist, checkpoint)", "video_id", v.ID.String(), "existing_frames", len(existingFrames))
 				frameMs = 0

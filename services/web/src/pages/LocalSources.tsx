@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { client } from '../api/client'
+import { useDialog } from '../components/Dialog'
 import type { LocalSource } from '../api/types'
 import { Loading, ErrorState } from '../components/Loading'
 
@@ -10,6 +11,7 @@ export default function LocalSources() {
   const [name, setName] = useState('')
   const [path, setPath] = useState('')
   const [adding, setAdding] = useState(false)
+  const { confirm, notify } = useDialog()
 
   const fetch = async () => {
     try {
@@ -29,15 +31,21 @@ export default function LocalSources() {
       await client.post('/api/v1/local-sources/', { name, path })
       setName(''); setPath('')
       await fetch()
-    } catch (e: any) { alert(e.message) } finally { setAdding(false) }
+    } catch (e: any) { await notify({ title: 'Add source failed', message: e.message }) } finally { setAdding(false) }
   }
 
   const onDelete = async (id: string) => {
-    if (!confirm('Delete local source? This does not delete video files.')) return
+    const ok = await confirm({
+      title: 'Delete local source',
+      message: 'Delete this local source? This does not delete video files.',
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
     try {
       await client.del(`/api/v1/local-sources/${id}`)
       await fetch()
-    } catch (e: any) { alert(e.message) }
+    } catch (e: any) { await notify({ title: 'Delete failed', message: e.message }) }
   }
 
   if (loading) return <Loading />

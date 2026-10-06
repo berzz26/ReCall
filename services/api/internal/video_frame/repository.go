@@ -28,7 +28,11 @@ func scan(row interface{ Scan(dest ...any) error }) (*VideoFrame, error) {
 }
 
 func (r *Repository) GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error) {
-	query := fmt.Sprintf(`SELECT %s FROM video_frames WHERE video_id = $1 ORDER BY frame_index ASC`, fields)
+	// Chronological order, not insertion order: refinement midpoints are
+	// appended out of sequence (FrameIndex reflects extraction order), so
+	// timestamp_seconds is the canonical ordering key with frame_index
+	// only as a deterministic tiebreak.
+	query := fmt.Sprintf(`SELECT %s FROM video_frames WHERE video_id = $1 ORDER BY timestamp_seconds ASC, frame_index ASC`, fields)
 	rows, err := r.db.Query(ctx, query, videoID)
 	if err != nil {
 		return nil, err
@@ -54,7 +58,8 @@ func (r *Repository) DeleteByVideoID(ctx context.Context, videoID uuid.UUID) err
 }
 
 func (r *Repository) GetBySegmentID(ctx context.Context, segmentID uuid.UUID) ([]VideoFrame, error) {
-	query := fmt.Sprintf(`SELECT %s FROM video_frames WHERE segment_id = $1 ORDER BY frame_index ASC`, fields)
+	// See GetByVideoID: chronological order with frame_index tiebreak.
+	query := fmt.Sprintf(`SELECT %s FROM video_frames WHERE segment_id = $1 ORDER BY timestamp_seconds ASC, frame_index ASC`, fields)
 	rows, err := r.db.Query(ctx, query, segmentID)
 	if err != nil {
 		return nil, err

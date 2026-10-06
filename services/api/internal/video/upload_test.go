@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/berzz26/recall/pkg/database"
 	"github.com/berzz26/recall/services/api/internal/storage"
@@ -103,6 +104,53 @@ func TestUploadUnsupportedType(t *testing.T) {
 	_, err := svc.UploadVideo(ctx, "bad.txt", bytes.NewReader([]byte("data")), "text/plain")
 	if err == nil {
 		t.Fatalf("expected error for unsupported type")
+	}
+}
+
+// cancelAfterFirstRead yields one chunk, then blocks until ctx is done —
+// simulating a client disconnect mid-upload.
+type cancelAfterFirstRead struct {
+	ctx   context.Context
+	first bool
+}
+
+func (r *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	if !r.first {
+		r.first = true
+		return copy(p, []byte("partial-data")), nil
+	}
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func TestUploadCancelledDeletesRow(t *testing.T) {
+	svc, _, cleanup := newTestServiceWithStorage(t)
+	defer cleanup()
+	bg := context.Background()
+
+	before, err := svc.ListVideos(bg, 100, 0)
+	if err != nil {
+		t.Fatalf("ListVideos failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.UploadVideo(ctx, "cancel.mp4", &cancelAfterFirstRead{ctx: ctx}, "video/mp4")
+		done <- err
+	}()
+	time.Sleep(time.Second)
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatalf("expected error after cancel")
+	}
+
+	after, err := svc.ListVideos(bg, 100, 0)
+	if err != nil {
+		t.Fatalf("ListVideos failed: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("cancelled upload left %d extra video row(s)", len(after)-len(before))
 	}
 }
 
