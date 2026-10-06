@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,6 +78,9 @@ type Service struct {
 	// extractOne performs single-timestamp decoding. Defaults to
 	// extractSingleFrame (ffmpeg seeking); tests override it.
 	extractOne extractFunc
+	// extractWorkers bounds concurrent ffmpeg decodes. <=0 means auto:
+	// min(NumCPU, 8). Configurable via FRAME_EXTRACT_WORKERS.
+	extractWorkers int
 	// videoPlanner, when set, replaces the fixed 2-second baseline grid
 	// with an adaptive plan (e.g. the visual-probe coarse planner). The
 	// extractor still only consumes the resulting timestamp list.
@@ -96,6 +101,33 @@ func NewService(repo *Repository, store storage.Storage, sampleInterval time.Dur
 		jpegQuality = 85
 	}
 	return &Service{repo: repo, storage: store, sampleInterval: sampleInterval, ffmpegPath: ffmpegPath, ffmpegTimeout: ffmpegTimeout, jpegQuality: jpegQuality, samplerBeta: sampler.DefaultBeta, extractOne: extractSingleFrame}
+}
+
+// WithExtractWorkers sets the max concurrent ffmpeg decodes (<=0 = auto)
+// and returns the service for chaining.
+func (s *Service) WithExtractWorkers(n int) *Service {
+	s.extractWorkers = n
+	return s
+}
+
+// effectiveWorkers resolves the worker count: explicit value when positive,
+// else min(NumCPU, 8).
+func (s *Service) effectiveWorkers() int {
+	if s.extractWorkers > 0 {
+		return s.extractWorkers
+	}
+	return defaultExtractWorkers()
+}
+
+func defaultExtractWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	if n > 8 {
+		n = 8
+	}
+	return n
 }
 
 // WithSamplerBeta sets the budget scale factor (B = ceil(beta * N_baseline))
@@ -296,7 +328,31 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		return nil
 	}
 
-	for i, ts := range timestamps {
+	// Parallel decode phase: up to effectiveWorkers() concurrent ffmpeg
+	// processes, results in timestamp order. Saving stays sequential below
+	// so storage keys, FrameIndex assignment, and DB batches are unchanged.
+	results, err := s.extractAllOrdered(ctx, videoPath, timestamps, plan.DurationSeconds)
+	if err != nil {
+		var xerr *extractError
+		ts := 0.0
+		if errors.As(err, &xerr) {
+			ts = xerr.Timestamp
+		}
+		cleanupOnFail()
+		if ctx.Err() == context.DeadlineExceeded {
+			slog.Error("frame: ffmpeg timeout", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
+			return nil, fmt.Errorf("ffmpeg timeout: %w", ctx.Err())
+		}
+		if ctx.Err() == context.Canceled {
+			slog.Error("frame: context canceled", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
+			return nil, fmt.Errorf("context canceled: %w", ctx.Err())
+		}
+		slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "timestamp", ts, "error", err)
+		return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
+	}
+
+	for i := range results {
+		ts := timestamps[i]
 		if err := ctx.Err(); err != nil {
 			cleanupOnFail()
 			return nil, err
@@ -306,28 +362,14 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			cleanupOnFail()
 			return nil, fmt.Errorf("no segment for timestamp %f", ts)
 		}
-		extractStart := time.Now()
-		jpegBytes, skipped, err := s.extractResilient(ctx, videoPath, ts, plan.DurationSeconds)
-		totalExtractMs += time.Since(extractStart).Milliseconds()
-		if err != nil {
-			cleanupOnFail()
-			if ctx.Err() == context.DeadlineExceeded {
-				slog.Error("frame: ffmpeg timeout", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
-				return nil, fmt.Errorf("ffmpeg timeout: %w", ctx.Err())
-			}
-			if ctx.Err() == context.Canceled {
-				slog.Error("frame: context canceled", "video_id", v.ID.String(), "timestamp", ts, "error", ctx.Err())
-				return nil, fmt.Errorf("context canceled: %w", ctx.Err())
-			}
-			slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "timestamp", ts, "error", err)
-			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
-		}
-		if skipped {
+		totalExtractMs += results[i].extractMs
+		if results[i].skipped {
 			// Phantom tail timestamp with no decodable frame: keep the
 			// other frames instead of failing the video.
 			slog.Warn("frame: skipped undecodable tail timestamp", "video_id", v.ID.String(), "timestamp", ts)
 			continue
 		}
+		jpegBytes := results[i].jpeg
 		fw, fh := width, height
 		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
 			fw = cfg.Width
@@ -500,6 +542,145 @@ func extractSingleFrame(ctx context.Context, ffmpegPath, videoPath string, times
 	return data, nil
 }
 
+// extractError carries a decode failure with its timestamp so callers can
+// reproduce the sequential error messages.
+type extractError struct {
+	Timestamp float64
+	Err       error
+}
+
+func (e *extractError) Error() string { return e.Err.Error() }
+func (e *extractError) Unwrap() error { return e.Err }
+
+// orderedFrame is one decoded timestamp in plan order. jpeg is nil when skipped.
+type orderedFrame struct {
+	jpeg      []byte
+	skipped   bool
+	extractMs int64
+}
+
+// frameResult is one worker's output for timestamps[idx].
+type frameResult struct {
+	idx       int
+	jpeg      []byte
+	skipped   bool
+	extractMs int64
+	err       *extractError
+}
+
+// extractChunkSize bounds transient memory: one chunk's JPEGs are held while
+// its workers run (~256 * ~200KB worst case), no matter how long the video.
+const extractChunkSize = 256
+
+// extractAllOrdered decodes every timestamp with up to effectiveWorkers()
+// concurrent ffmpeg processes and returns results in timestamp order.
+// Skipped (phantom tail) entries keep their position with skipped=true.
+// The first failure in timestamp order aborts remaining work and is returned
+// as *extractError, matching sequential semantics (fail at the lowest failing
+// timestamp, never a partial frame set).
+func (s *Service) extractAllOrdered(ctx context.Context, videoPath string, timestamps []float64, durationSeconds float64) ([]orderedFrame, error) {
+	out := make([]orderedFrame, 0, len(timestamps))
+	for start := 0; start < len(timestamps); start += extractChunkSize {
+		end := start + extractChunkSize
+		if end > len(timestamps) {
+			end = len(timestamps)
+		}
+		chunk, err := s.extractChunk(ctx, videoPath, timestamps[start:end], durationSeconds)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, chunk...)
+	}
+	return out, nil
+}
+
+func (s *Service) extractChunk(ctx context.Context, videoPath string, timestamps []float64, durationSeconds float64) ([]orderedFrame, error) {
+	n := len(timestamps)
+	out := make([]orderedFrame, n)
+	if n == 0 {
+		return out, nil
+	}
+	workers := s.effectiveWorkers()
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	resCh := make(chan frameResult, workers*2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(jobs)
+		for i := range timestamps {
+			select {
+			case jobs <- i:
+			case <-cctx.Done():
+				return
+			}
+		}
+	}()
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				start := time.Now()
+				jpeg, skipped, err := s.extractResilient(cctx, videoPath, timestamps[i], durationSeconds)
+				r := frameResult{idx: i, jpeg: jpeg, skipped: skipped, extractMs: time.Since(start).Milliseconds()}
+				if err != nil {
+					r.err = &extractError{Timestamp: timestamps[i], Err: err}
+				}
+				select {
+				case resCh <- r:
+				case <-cctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	pending := make(map[int]frameResult, workers*2)
+	next := 0
+	var firstErr *extractError
+	for r := range resCh {
+		pending[r.idx] = r
+		for {
+			p, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			if p.err != nil && firstErr == nil {
+				firstErr = p.err
+			}
+			out[next] = orderedFrame{jpeg: p.jpeg, skipped: p.skipped, extractMs: p.extractMs}
+			next++
+		}
+		if firstErr != nil {
+			break
+		}
+	}
+	if firstErr != nil {
+		cancel()
+		wg.Wait()
+		return nil, firstErr
+	}
+	return out, nil
+}
+
 // extractResilient decodes the requested timestamp with tolerance for
 // timestamps that have no decodable frame. It returns (data, skipped, err):
 //   - data non-nil: frame bytes. On step-back success the bytes come from a
@@ -622,7 +803,18 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			_ = s.storage.Delete(ctx, k)
 		}
 	}
-	for _, ts := range fresh {
+	results, err := s.extractAllOrdered(ctx, videoPath, fresh, durationSeconds)
+	if err != nil {
+		var xerr *extractError
+		ts := 0.0
+		if errors.As(err, &xerr) {
+			ts = xerr.Timestamp
+		}
+		cleanupOnFail()
+		return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
+	}
+	for i := range results {
+		ts := fresh[i]
 		if err := ctx.Err(); err != nil {
 			cleanupOnFail()
 			return nil, err
@@ -632,15 +824,11 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			cleanupOnFail()
 			return nil, fmt.Errorf("no segment for timestamp %f", ts)
 		}
-		jpegBytes, skipped, err := s.extractResilient(ctx, videoPath, ts, durationSeconds)
-		if err != nil {
-			cleanupOnFail()
-			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
-		}
-		if skipped {
+		if results[i].skipped {
 			slog.Warn("frame: skipped undecodable tail timestamp", "video_id", v.ID.String(), "timestamp", ts)
 			continue
 		}
+		jpegBytes := results[i].jpeg
 		fw, fh := width, height
 		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
 			fw = cfg.Width

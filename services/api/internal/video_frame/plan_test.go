@@ -9,6 +9,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,6 +90,21 @@ type planTestFixture struct {
 	vid      *video.Video
 	segments []video_segment.VideoSegment
 	calls    *[]float64 // timestamps seen by the stub decoder
+	callsMu  sync.Mutex // decodes run concurrently; serialize recording
+}
+
+// recordCall logs a decoder timestamp (thread-safe).
+func (f *planTestFixture) recordCall(ts float64) {
+	f.callsMu.Lock()
+	*f.calls = append(*f.calls, ts)
+	f.callsMu.Unlock()
+}
+
+// callSnapshot returns the recorded decoder timestamps.
+func (f *planTestFixture) callSnapshot() []float64 {
+	f.callsMu.Lock()
+	defer f.callsMu.Unlock()
+	return append([]float64(nil), *f.calls...)
 }
 
 // newPlanFixture builds a Service whose decoder is stubbed (no ffmpeg)
@@ -119,11 +136,12 @@ func newPlanFixture(t *testing.T, duration float64) *planTestFixture {
 	svc.repo = repo
 	var calls []float64
 	payload := stubJPEG(t, 8, 6)
+	fx := &planTestFixture{svc: svc, repo: repo, store: store, dir: dir, vid: v, segments: segs, calls: &calls}
 	svc.extractOne = func(_ context.Context, _, _ string, ts float64, _ int) ([]byte, error) {
-		calls = append(calls, ts)
+		fx.recordCall(ts)
 		return payload, nil
 	}
-	return &planTestFixture{svc: svc, repo: repo, store: store, dir: dir, vid: v, segments: segs, calls: &calls}
+	return fx
 }
 
 func TestPlannerExtractorContract(t *testing.T) {
@@ -145,8 +163,9 @@ func TestPlannerExtractorContract(t *testing.T) {
 		t.Fatalf("expected %d frames got %d", plan.Len(), len(frames))
 	}
 	want := plan.Timestamps()
-	if len(*fx.calls) != len(want) {
-		t.Fatalf("decoder called %d times, want %d (batch, one call per timestamp)", len(*fx.calls), len(want))
+	calls := fx.callSnapshot()
+	if len(calls) != len(want) {
+		t.Fatalf("decoder called %d times, want %d (batch, one call per timestamp)", len(calls), len(want))
 	}
 	for i, f := range frames {
 		// VideoFrame shape unchanged for downstream consumers.
@@ -168,8 +187,16 @@ func TestPlannerExtractorContract(t *testing.T) {
 		if ok, _ := fx.store.Exists(ctx, f.StorageKey); !ok {
 			t.Fatalf("frame %d file missing %s", i, f.StorageKey)
 		}
-		if math.Abs((*fx.calls)[i]-want[i]) > 1e-9 {
-			t.Fatalf("decoder call %d got %v want %v", i, (*fx.calls)[i], want[i])
+	}
+	// Decodes run concurrently, so call order is scheduler-defined; the
+	// decoded set must equal the plan.
+	sortedCalls := append([]float64(nil), calls...)
+	sort.Float64s(sortedCalls)
+	sortedWant := append([]float64(nil), want...)
+	sort.Float64s(sortedWant)
+	for i := range sortedWant {
+		if math.Abs(sortedCalls[i]-sortedWant[i]) > 1e-9 {
+			t.Fatalf("decoded set mismatch: got %v want %v", sortedCalls, sortedWant)
 		}
 	}
 }
@@ -314,7 +341,9 @@ func TestExtractAdditionalSkipsExisting(t *testing.T) {
 	if _, err := fx.svc.GenerateForVideoWithPlan(ctx, fx.vid, fx.segments, plan, 1280, 720); err != nil {
 		t.Fatalf("GenerateForVideoWithPlan: %v", err)
 	}
+	fx.callsMu.Lock()
 	*fx.calls = nil // reset decoder call recording
+	fx.callsMu.Unlock()
 
 	added, err := fx.svc.ExtractAdditional(ctx, fx.vid, fx.segments, []float64{2, 4, 4.0, 6}, duration, 1280, 720)
 	if err != nil {
@@ -323,8 +352,10 @@ func TestExtractAdditionalSkipsExisting(t *testing.T) {
 	if len(added) != 2 {
 		t.Fatalf("want 2 new frames (2 and 6), got %d", len(added))
 	}
-	if len(*fx.calls) != 2 || (*fx.calls)[0] != 2 || (*fx.calls)[1] != 6 {
-		t.Fatalf("decoder must run only for new timestamps, got %v", *fx.calls)
+	gotCalls := fx.callSnapshot()
+	sort.Float64s(gotCalls)
+	if len(gotCalls) != 2 || gotCalls[0] != 2 || gotCalls[1] != 6 {
+		t.Fatalf("decoder must run only for new timestamps, got %v", gotCalls)
 	}
 	if added[0].FrameIndex != 3 || added[1].FrameIndex != 4 {
 		t.Fatalf("FrameIndex must continue after existing: %+v", added)

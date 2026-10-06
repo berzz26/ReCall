@@ -16,10 +16,10 @@ import (
 
 // emptyAt returns a stub decoder that yields valid JPEGs except at the given
 // timestamps, where it reports an empty decode like the real ffmpeg path.
-func emptyAt(t *testing.T, payload []byte, calls *[]float64, empty func(ts float64) bool) extractFunc {
+func emptyAt(t *testing.T, payload []byte, record func(float64), empty func(ts float64) bool) extractFunc {
 	t.Helper()
 	return func(_ context.Context, _, _ string, ts float64, _ int) ([]byte, error) {
-		*calls = append(*calls, ts)
+		record(ts)
 		if empty(ts) {
 			return nil, &emptyFrameError{Timestamp: ts}
 		}
@@ -49,7 +49,7 @@ func TestPhantomTailSkipped(t *testing.T) {
 	// Nothing decodable from 298.0 on: the direct attempt at plan ts 298.0
 	// fails but recovers via step-back to 297.5, while 300.0 exhausts the
 	// whole step-back window and is skipped as phantom tail.
-	fx.svc.extractOne = emptyAt(t, payload, fx.calls, func(ts float64) bool {
+	fx.svc.extractOne = emptyAt(t, payload, fx.recordCall, func(ts float64) bool {
 		return ts >= 298.0-1e-9
 	})
 
@@ -78,8 +78,9 @@ func TestPhantomTailSkipped(t *testing.T) {
 	if math.Abs(last.TimestampSeconds-298.0) > 1e-9 {
 		t.Fatalf("last frame ts %v, want 298.0", last.TimestampSeconds)
 	}
-	if !sawCall(*fx.calls, 300.0) || !sawCall(*fx.calls, 298.0) {
-		t.Fatalf("expected decode attempts at 300.0 and step-back 298.0, got tail %v", (*fx.calls)[len(*fx.calls)-5:])
+	calls := fx.callSnapshot()
+	if !sawCall(calls, 300.0) || !sawCall(calls, 298.0) {
+		t.Fatalf("expected decode attempts at 300.0 and step-back 298.0, got tail %v", calls[len(calls)-5:])
 	}
 }
 
@@ -91,7 +92,7 @@ func TestStepBackRecovers(t *testing.T) {
 	ctx := context.Background()
 	payload := stubJPEG(t, 8, 6)
 
-	fx.svc.extractOne = emptyAt(t, payload, fx.calls, func(ts float64) bool {
+	fx.svc.extractOne = emptyAt(t, payload, fx.recordCall, func(ts float64) bool {
 		return math.Abs(ts-100.0) < 1e-9
 	})
 
@@ -117,7 +118,7 @@ func TestStepBackRecovers(t *testing.T) {
 	if !found {
 		t.Fatalf("frame at requested ts 100.0 missing")
 	}
-	if !sawCall(*fx.calls, 99.5) {
+	if !sawCall(fx.callSnapshot(), 99.5) {
 		t.Fatalf("expected step-back decode at 99.5")
 	}
 }
@@ -130,7 +131,7 @@ func TestPersistentGapStillFails(t *testing.T) {
 	ctx := context.Background()
 	payload := stubJPEG(t, 8, 6)
 
-	fx.svc.extractOne = emptyAt(t, payload, fx.calls, func(ts float64) bool {
+	fx.svc.extractOne = emptyAt(t, payload, fx.recordCall, func(ts float64) bool {
 		return ts >= 98.0-1e-9 && ts <= 100.0+1e-9
 	})
 

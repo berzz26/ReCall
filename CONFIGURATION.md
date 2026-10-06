@@ -34,6 +34,7 @@ Anything not set falls back to the built-in default listed below.
 | `EVENT_MOVEMENT_THRESHOLD` | `0.05` | Normalized object-center movement (0–1) within a segment that counts as a movement event. Lower = more events. |
 | `FFPROBE_PATH` / `FFMPEG_PATH` | `ffprobe` / `ffmpeg` | Binaries for metadata probing and frame extraction. Bare names resolve via `PATH`; set absolute paths to pin versions. |
 | `FFPROBE_TIMEOUT` / `FFMPEG_TIMEOUT` | `60s` | Kill a hung probe/extract after this long; the video is marked failed instead of blocking the worker forever. |
+| `FRAME_EXTRACT_WORKERS` | auto (`min(NumCPU, 8)`) | Max concurrent ffmpeg decodes during frame extraction. Extraction is one ffmpeg run per timestamp, so this parallelizes it near-linearly up to your core count. Set explicitly to cap CPU usage (e.g. `4`); higher than core count gives diminishing returns since each ffmpeg already multithreads. |
 
 ## 3. Frame sampler
 

@@ -51,6 +51,7 @@ type Config struct {
 	ModelPath              string
 	PythonPath             string
 	YOLOBatchSize          int
+	ExtractWorkers         int
 	EventMovementThreshold float64
 	VisionProvider         string
 	VisionPythonPath       string
@@ -442,6 +443,19 @@ func Load() Config {
 		yoloBatchSize = parsed
 	}
 
+	// 0/auto = min(NumCPU, 8), resolved by the video_frame service.
+	extractWorkers := 0
+	if v := os.Getenv("FRAME_EXTRACT_WORKERS"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			panic(fmt.Sprintf("invalid FRAME_EXTRACT_WORKERS %q: %v", v, err))
+		}
+		if parsed <= 0 {
+			panic(fmt.Sprintf("FRAME_EXTRACT_WORKERS must be > 0, got %s", v))
+		}
+		extractWorkers = parsed
+	}
+
 	movementThreshold := 0.05
 	if v := os.Getenv("EVENT_MOVEMENT_THRESHOLD"); v != "" {
 		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
@@ -747,6 +761,7 @@ func Load() Config {
 		ModelPath:              modelPath,
 		PythonPath:             pythonPath,
 		YOLOBatchSize:          yoloBatchSize,
+		ExtractWorkers:         extractWorkers,
 		EventMovementThreshold: movementThreshold,
 		VisionProvider:         visionProvider,
 		VisionPythonPath:       visionPythonPath,
