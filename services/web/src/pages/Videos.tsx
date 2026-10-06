@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useRef, useState, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { client } from '../api/client'
 import { useDialog } from '../components/Dialog'
@@ -13,6 +13,8 @@ export default function Videos() {
   const [q, setQ] = useState('')
   const [sort, setSort] = useState('newest')
   const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState<{ name: string; loaded: number; total: number } | null>(null)
+  const uploadAbort = useRef<AbortController | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const { confirm, notify } = useDialog()
 
@@ -43,12 +45,27 @@ export default function Videos() {
     } catch (e: any) { setErr(e.message) } finally { setLoading(false) }
   }
   useEffect(() => { fetchAll() }, [])
+  useEffect(() => () => { uploadAbort.current?.abort() }, [])
 
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]; if (!f) return
+    if (uploadAbort.current) { e.target.value = ''; return }
+    const ctrl = new AbortController()
+    uploadAbort.current = ctrl
     setUploading(true)
-    try { await client.upload('/api/v1/videos/', f); await fetchAll() } catch (err: any) { await notify({ title: 'Upload failed', message: err.message }) } finally { setUploading(false); e.target.value = '' }
+    setUploadProgress({ name: f.name, loaded: 0, total: f.size })
+    try {
+      await client.upload('/api/v1/videos/', f, {
+        signal: ctrl.signal,
+        onProgress: (loaded, total) => setUploadProgress({ name: f.name, loaded, total }),
+      })
+      await fetchAll()
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') await notify({ title: 'Upload failed', message: err.message })
+    } finally { setUploading(false); setUploadProgress(null); uploadAbort.current = null; e.target.value = '' }
   }
+
+  const cancelUpload = () => { uploadAbort.current?.abort() }
 
   const onDelete = async (id: string, filename: string) => {
     const ok = await confirm({
@@ -179,6 +196,28 @@ export default function Videos() {
       <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 12 }}>Showing {filtered.length} videos</div>
 
       <style>{`@media(max-width:1200px){div[style*="grid-template-columns: repeat(4"]{grid-template-columns:repeat(3,1fr)!important}}@media(max-width:900px){div[style*="grid-template-columns: repeat(4"]{grid-template-columns:repeat(2,1fr)!important}}@media(max-width:560px){div[style*="grid-template-columns: repeat(4"]{grid-template-columns:1fr!important}}`}</style>
+
+      {uploadProgress && (() => {
+        const pct = uploadProgress.total > 0 ? Math.min(100, Math.round(uploadProgress.loaded / uploadProgress.total * 100)) : 0
+        const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`
+        return (
+          <div className="card" style={{ position: 'fixed', right: 18, bottom: 18, width: 320, zIndex: 60, padding: 14, boxShadow: '0 8px 28px rgba(16,24,40,0.16)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 200 }} title={uploadProgress.name}>
+                Uploading {uploadProgress.name}
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--accent-dark)' }}>{pct}%</div>
+            </div>
+            <div style={{ height: 8, borderRadius: 6, background: '#eef1f0', overflow: 'hidden', margin: '8px 0 6px 0' }}>
+              <div style={{ height: '100%', width: `${pct}%`, borderRadius: 6, background: 'var(--accent)', transition: 'width 0.15s' }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ fontSize: 11, color: 'var(--muted)' }}>{mb(uploadProgress.loaded)} of {mb(uploadProgress.total)}</div>
+              <button className="btn btn-sm" onClick={cancelUpload}>Cancel</button>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

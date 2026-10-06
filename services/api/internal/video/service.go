@@ -230,8 +230,19 @@ func (s *Service) UploadVideo(ctx context.Context, filename string, reader io.Re
 		err = copyErr
 	}
 	if err != nil {
-		s.storage.Delete(ctx, storageKey)
-		s.repo.UpdateStatus(ctx, v.ID, StatusFailed)
+		// Detached ctx for cleanup: the request ctx may already be
+		// cancelled (client disconnect), which would abort the cleanup
+		// queries themselves.
+		cleanupCtx := context.WithoutCancel(ctx)
+		s.storage.Delete(cleanupCtx, storageKey)
+		if ctx.Err() != nil {
+			// Client went away mid-upload (e.g. Cancel pressed): remove
+			// the row entirely so a cancelled upload doesn't linger as
+			// FAILED in the video list.
+			_ = s.repo.Delete(cleanupCtx, v.ID)
+		} else {
+			s.repo.UpdateStatus(cleanupCtx, v.ID, StatusFailed)
+		}
 		return nil, fmt.Errorf("save file: %w", err)
 	}
 

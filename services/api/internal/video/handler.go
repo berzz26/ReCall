@@ -70,9 +70,11 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		}
 
 		// Request-scoped context: no artificial timeout (network transfer
-		// time now counts, unlike the old buffered path), and a client
-		// disconnect cancels the copy to disk.
-		v, err := h.service.UploadVideo(c.UserContext(), filename, part, partMime)
+		// time now counts, unlike the old buffered path). c.Context() is
+		// tied to the connection, so a client disconnect (e.g. pressing
+		// Cancel in the UI) cancels the copy to disk and lets the service
+		// clean up the partial upload instead of leaving a FAILED row.
+		v, err := h.service.UploadVideo(c.Context(), filename, part, partMime)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
