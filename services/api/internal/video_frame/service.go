@@ -3,6 +3,7 @@ package video_frame
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
@@ -31,6 +32,25 @@ type frameRepository interface {
 	DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error
 	CreateBatch(ctx context.Context, frames []VideoFrame) ([]VideoFrame, error)
 }
+
+// emptyFrameError marks a decode that ran fine but yielded no frame bytes:
+// the requested timestamp has no decodable frame (phantom tail past the last
+// real frame, or a local gap). The message matches the legacy string so
+// existing log searches keep working. The extractor retries these with
+// step-back and skips them at the EOF edge instead of failing the video.
+type emptyFrameError struct{ Timestamp float64 }
+
+func (e *emptyFrameError) Error() string {
+	return fmt.Sprintf("ffmpeg produced empty frame at %f", e.Timestamp)
+}
+
+// Retry policy for empty decodes: step back in extractStepBack increments up
+// to extractMaxStepBack (one baseline interval) looking for the nearest
+// decodable frame.
+const (
+	extractStepBack    = 0.5
+	extractMaxStepBack = 2.0
+)
 
 // extractFunc extracts one frame at the given timestamp and returns the
 // JPEG bytes. It is a field (not a hard ffmpeg call) so tests can stub the
@@ -287,7 +307,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			return nil, fmt.Errorf("no segment for timestamp %f", ts)
 		}
 		extractStart := time.Now()
-		jpegBytes, err := s.extractOne(ctx, s.ffmpegPath, videoPath, ts, s.jpegQuality)
+		jpegBytes, skipped, err := s.extractResilient(ctx, videoPath, ts, plan.DurationSeconds)
 		totalExtractMs += time.Since(extractStart).Milliseconds()
 		if err != nil {
 			cleanupOnFail()
@@ -302,12 +322,19 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			slog.Error("frame: ffmpeg failed", "video_id", v.ID.String(), "timestamp", ts, "error", err)
 			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
 		}
+		if skipped {
+			// Phantom tail timestamp with no decodable frame: keep the
+			// other frames instead of failing the video.
+			slog.Warn("frame: skipped undecodable tail timestamp", "video_id", v.ID.String(), "timestamp", ts)
+			continue
+		}
 		fw, fh := width, height
 		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
 			fw = cfg.Width
 			fh = cfg.Height
 		}
-		key := frameStorageKey(v.ID, i)
+		frameIdx := len(allSaved) + len(batch)
+		key := frameStorageKey(v.ID, frameIdx)
 		saveStart := time.Now()
 		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
 			cleanupOnFail()
@@ -318,7 +345,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		batch = append(batch, VideoFrame{
 			VideoID:          v.ID,
 			SegmentID:        seg.ID,
-			FrameIndex:       i,
+			FrameIndex:       frameIdx,
 			TimestampSeconds: ts,
 			StorageKey:       key,
 			Width:            fw,
@@ -468,9 +495,65 @@ func extractSingleFrame(ctx context.Context, ffmpegPath, videoPath string, times
 		return nil, fmt.Errorf("failed to read extracted frame: %w", err)
 	}
 	if len(data) == 0 {
-		return nil, fmt.Errorf("ffmpeg produced empty frame at %f", timestamp)
+		return nil, &emptyFrameError{Timestamp: timestamp}
 	}
 	return data, nil
+}
+
+// extractResilient decodes the requested timestamp with tolerance for
+// timestamps that have no decodable frame. It returns (data, skipped, err):
+//   - data non-nil: frame bytes. On step-back success the bytes come from a
+//     slightly earlier timestamp, but the VideoFrame still records the
+//     requested timestamp (seek lands on-or-near is the standing contract,
+//     and segment association already used the requested timestamp).
+//   - skipped true: the timestamp is a phantom tail — within one sample
+//     interval of durationSeconds with no decodable frame. The caller should
+//     skip it with a warning, not fail the video.
+//   - err non-nil: genuine failure (decoder error, timeout, cancel, or a
+//     persistent gap away from EOF); the caller fails as before.
+//
+// Only empty-output decodes are retried. Hard decoder errors and context
+// cancellation fail immediately without retry.
+func (s *Service) extractResilient(ctx context.Context, videoPath string, timestamp, durationSeconds float64) ([]byte, bool, error) {
+	var empty *emptyFrameError
+	data, err := s.extractOne(ctx, s.ffmpegPath, videoPath, timestamp, s.jpegQuality)
+	if err == nil {
+		return data, false, nil
+	}
+	if ctx.Err() != nil {
+		return nil, false, err
+	}
+	if !errors.As(err, &empty) {
+		return nil, false, err
+	}
+	for back := extractStepBack; back <= extractMaxStepBack+1e-9; back += extractStepBack {
+		t2 := timestamp - back
+		if t2 < 0 {
+			t2 = 0
+		}
+		retry, retryErr := s.extractOne(ctx, s.ffmpegPath, videoPath, t2, s.jpegQuality)
+		if retryErr == nil {
+			slog.Warn("frame: stepped back to decodable timestamp",
+				"requested", timestamp, "extracted", t2)
+			return retry, false, nil
+		}
+		if ctx.Err() != nil {
+			return nil, false, retryErr
+		}
+		if !errors.As(retryErr, &empty) {
+			return nil, false, retryErr
+		}
+		if t2 == 0 {
+			break
+		}
+	}
+	// Nothing decodable from timestamp back to timestamp-maxStepBack. Near
+	// EOF this is the phantom tail (container duration overshoots the last
+	// real frame): skip it. Anywhere else it is a real gap: fail.
+	if durationSeconds-timestamp <= s.sampleInterval.Seconds() {
+		return nil, true, nil
+	}
+	return nil, false, err
 }
 
 // ExtractAdditional extracts extra timestamps WITHOUT deleting existing
@@ -539,7 +622,7 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			_ = s.storage.Delete(ctx, k)
 		}
 	}
-	for i, ts := range fresh {
+	for _, ts := range fresh {
 		if err := ctx.Err(); err != nil {
 			cleanupOnFail()
 			return nil, err
@@ -549,17 +632,22 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			cleanupOnFail()
 			return nil, fmt.Errorf("no segment for timestamp %f", ts)
 		}
-		jpegBytes, err := s.extractOne(ctx, s.ffmpegPath, videoPath, ts, s.jpegQuality)
+		jpegBytes, skipped, err := s.extractResilient(ctx, videoPath, ts, durationSeconds)
 		if err != nil {
 			cleanupOnFail()
 			return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
+		}
+		if skipped {
+			slog.Warn("frame: skipped undecodable tail timestamp", "video_id", v.ID.String(), "timestamp", ts)
+			continue
 		}
 		fw, fh := width, height
 		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(jpegBytes)); cfgErr == nil && cfg.Width > 0 && cfg.Height > 0 {
 			fw = cfg.Width
 			fh = cfg.Height
 		}
-		key := frameStorageKey(v.ID, base+i)
+		frameIdx := base + len(batch)
+		key := frameStorageKey(v.ID, frameIdx)
 		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
 			cleanupOnFail()
 			return nil, fmt.Errorf("failed to store frame at %f: %w", ts, err)
@@ -568,7 +656,7 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 		batch = append(batch, VideoFrame{
 			VideoID:          v.ID,
 			SegmentID:        seg.ID,
-			FrameIndex:       base + i,
+			FrameIndex:       frameIdx,
 			TimestampSeconds: ts,
 			StorageKey:       key,
 			Width:            fw,
@@ -585,6 +673,7 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 		"requested", len(want),
 		"extracted", len(saved),
 		"skipped_existing", len(want)-len(fresh),
+		"skipped_undecodable", len(fresh)-len(saved),
 	)
 	return saved, nil
 }
