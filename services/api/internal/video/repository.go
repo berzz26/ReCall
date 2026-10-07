@@ -18,7 +18,7 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-const videoFields = `id, filename, content_hash, mime_type, size_bytes, source_type, source_path, storage_key, source_mtime, processing_error, status, created_at, updated_at`
+const videoFields = `id, filename, content_hash, mime_type, size_bytes, source_type, source_path, storage_key, playable_key, source_mtime, processing_error, status, created_at, updated_at`
 
 func scanVideo(row interface{ Scan(dest ...any) error }) (*Video, error) {
 	var v Video
@@ -31,6 +31,7 @@ func scanVideo(row interface{ Scan(dest ...any) error }) (*Video, error) {
 		&v.SourceType,
 		&v.SourcePath,
 		&v.StorageKey,
+		&v.PlayableKey,
 		&v.SourceMtime,
 		&v.ProcessingError,
 		&v.Status,
@@ -125,6 +126,17 @@ func (r *Repository) UpdateUpload(ctx context.Context, id uuid.UUID, storageKey,
 		RETURNING %s
 	`, videoFields)
 	row := r.db.QueryRow(ctx, query, id, storageKey, contentHash, mimeType, sizeBytes, status)
+	return scanVideo(row)
+}
+
+// SetPlayableKey records the storage key of the browser-playable proxy.
+func (r *Repository) SetPlayableKey(ctx context.Context, id uuid.UUID, playableKey string) (*Video, error) {
+	query := fmt.Sprintf(`
+		UPDATE videos SET playable_key = $2, updated_at = now()
+		WHERE id = $1
+		RETURNING %s
+	`, videoFields)
+	row := r.db.QueryRow(ctx, query, id, playableKey)
 	return scanVideo(row)
 }
 

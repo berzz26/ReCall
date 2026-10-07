@@ -17,6 +17,7 @@ import (
 	"github.com/berzz26/recall/services/api/internal/handlers"
 	"github.com/berzz26/recall/services/api/internal/health"
 	local_source "github.com/berzz26/recall/services/api/internal/local_source"
+	"github.com/berzz26/recall/services/api/internal/playable"
 	"github.com/berzz26/recall/services/api/internal/processing"
 	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/search"
@@ -250,6 +251,13 @@ func main() {
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)
 	worker := processing.NewWorker(videoService, processor, cfg.PollInterval)
+	// Browser-playable proxy (H.264 sidecar) for codecs browsers cannot
+	// decode (e.g. MPEG-4 Part 2). Runs before each processing job; never
+	// fails the video on transcode errors. Also serves existing videos via
+	// POST /api/v1/videos/:id/playable below.
+	playableService := playable.NewService(videoRepo, store, cfg.FFprobePath, cfg.FFmpegPath, cfg.PlayableTimeout, nil)
+	playableHandler := playable.NewHandler(playableService)
+	worker.WithPlayable(playableService)
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	go worker.Start(workerCtx)
 
@@ -299,7 +307,12 @@ func main() {
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
-	v1.Mount("/videos", videoHandler.SetupRoutes(bodyLimit))
+	// The /videos sub-app owns its route space (a parent-level
+	// /videos/:id/* route registered after Mount would be shadowed), so the
+	// proxy endpoint is attached to the sub-app directly.
+	videoRoutes := videoHandler.SetupRoutes(bodyLimit)
+	videoRoutes.Post("/:id/playable", playableHandler.EnsureProxy)
+	v1.Mount("/videos", videoRoutes)
 	v1.Get("/videos/:id/media", detailHandler.GetMedia)
 	v1.Get("/videos/:id/stream", videoStreamHandler.Stream)
 	v1.Get("/videos/:id/segments", detailHandler.GetSegments)

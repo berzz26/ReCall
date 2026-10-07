@@ -12,38 +12,42 @@ import (
 )
 
 type Config struct {
-	Env                    string
-	Port                   string
-	Addr                   string
-	DatabaseURL            string
-	StorageRoot            string
-	MaxUploadSize          int64
-	StabilitySeconds       int
-	StabilityDuration      time.Duration
-	PollInterval           time.Duration
-	FFprobePath            string
-	FFprobeTimeout         time.Duration
-	SegmentDuration        time.Duration
-	FrameSampleInterval    time.Duration
-	SamplerBeta            float64
-	SamplerAdaptive        bool
-	ProbeFPS               float64
-	ProbeSize              int
-	ProbeGrid              int
-	ProbeNoiseK            float64
-	CoarseInterval         time.Duration
-	CoarseMaxGap           time.Duration
-	CoarseFKeep            float64
-	SamplerPlanTimeout     time.Duration
-	SamplerGamma           float64
-	SamplerMinGap          time.Duration
-	SamplerEpsilon         float64
-	SamplerMaxRounds       int
-	SamplerShadow          bool
-	SamplerBusyThreshold   float64
-	SamplerBusyFraction    float64
-	FFmpegPath             string
-	FFmpegTimeout          time.Duration
+	Env                  string
+	Port                 string
+	Addr                 string
+	DatabaseURL          string
+	StorageRoot          string
+	MaxUploadSize        int64
+	StabilitySeconds     int
+	StabilityDuration    time.Duration
+	PollInterval         time.Duration
+	FFprobePath          string
+	FFprobeTimeout       time.Duration
+	SegmentDuration      time.Duration
+	FrameSampleInterval  time.Duration
+	SamplerBeta          float64
+	SamplerAdaptive      bool
+	ProbeFPS             float64
+	ProbeSize            int
+	ProbeGrid            int
+	ProbeNoiseK          float64
+	CoarseInterval       time.Duration
+	CoarseMaxGap         time.Duration
+	CoarseFKeep          float64
+	SamplerPlanTimeout   time.Duration
+	SamplerGamma         float64
+	SamplerMinGap        time.Duration
+	SamplerEpsilon       float64
+	SamplerMaxRounds     int
+	SamplerShadow        bool
+	SamplerBusyThreshold float64
+	SamplerBusyFraction  float64
+	FFmpegPath           string
+	FFmpegTimeout        time.Duration
+	// PlayableTimeout bounds one browser-proxy transcode (H.264 sidecar for
+	// codecs browsers cannot decode). Transcoding hundreds of MB takes
+	// minutes, so this defaults far above the frame-extraction timeout.
+	PlayableTimeout        time.Duration
 	FrameJPEGQuality       int
 	DetectionThreshold     float64
 	DetectorName           string
@@ -359,6 +363,15 @@ func Load() Config {
 	if v := os.Getenv("FFMPEG_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			ffmpegTimeout = d
+		}
+	}
+
+	playableTimeout := 30 * time.Minute
+	if v := os.Getenv("PLAYABLE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			playableTimeout = d
+		} else {
+			panic(fmt.Sprintf("invalid PLAYABLE_TIMEOUT %q", v))
 		}
 	}
 
@@ -754,6 +767,7 @@ func Load() Config {
 		SamplerBusyFraction:    samplerBusyFraction,
 		FFmpegPath:             ffmpegPath,
 		FFmpegTimeout:          ffmpegTimeout,
+		PlayableTimeout:        playableTimeout,
 		FrameJPEGQuality:       frameJPEGQuality,
 		DetectionThreshold:     detectionThreshold,
 		DetectorName:           detectorName,

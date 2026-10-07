@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/berzz26/recall/services/api/internal/playable"
 	"github.com/berzz26/recall/services/api/internal/storage"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/gofiber/fiber/v2"
@@ -35,6 +36,18 @@ func (h *VideoStreamHandler) Stream(c *fiber.Ctx) error {
 	mime := v.MimeType
 	if mime == "" {
 		mime = "video/mp4"
+	}
+	// Prefer the browser-playable proxy when one was generated: the original
+	// may use a codec browsers cannot decode (e.g. MPEG-4 Part 2), in which
+	// case serving it yields "no video with supported format and MIME type".
+	if v.PlayableKey != nil && *v.PlayableKey != "" {
+		if p, err := playable.LocalProxyPath(h.storage, *v.PlayableKey); err == nil {
+			if _, serr := os.Stat(p); serr == nil {
+				c.Set("Content-Type", "video/mp4")
+				c.Set("Accept-Ranges", "bytes")
+				return c.SendFile(p)
+			}
+		}
 	}
 	// Prefer storage key for UPLOAD
 	if v.StorageKey != nil && *v.StorageKey != "" {

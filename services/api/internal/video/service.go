@@ -365,6 +365,12 @@ func (s *Service) DeleteVideo(ctx context.Context, id uuid.UUID) error {
 		_ = s.storage.Delete(ctx, *v.StorageKey)
 	}
 
+	// Delete the browser-playable proxy if one was generated (lives under
+	// storage regardless of source type).
+	if v.PlayableKey != nil && *v.PlayableKey != "" && s.storage != nil {
+		_ = s.storage.Delete(ctx, *v.PlayableKey)
+	}
+
 	// Delete frame images from storage (DB rows cascade via ON DELETE CASCADE)
 	if s.storage != nil {
 		for _, k := range frameKeys {
