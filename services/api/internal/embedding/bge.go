@@ -183,11 +183,15 @@ func (b *BGEEmbedder) launchPersistent(ctx context.Context) (*persistSession, er
 	case err := <-errCh:
 		return nil, fmt.Errorf("persistent embedding failed to start: %w", err)
 	case line := <-readyCh:
+		trimmed := strings.TrimSpace(line)
 		var resp map[string]any
-		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &resp); err == nil {
-			if st, _ := resp["status"].(string); st != "ready" {
-				slog.Warn("embedding persistent unexpected ready status", "response", strings.TrimSpace(line))
-			}
+		if err := json.Unmarshal([]byte(trimmed), &resp); err != nil {
+			_ = cmd.Process.Kill()
+			return nil, fmt.Errorf("persistent embedding bad ready line %q: %w", trimmed, err)
+		}
+		if st, _ := resp["status"].(string); st != "ready" {
+			_ = cmd.Process.Kill()
+			return nil, fmt.Errorf("persistent embedding unexpected ready status %q", trimmed)
 		}
 		return s, nil
 	}

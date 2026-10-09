@@ -30,6 +30,10 @@ def log(msg, **fields):
 
 def main():
     args = parse_args()
+    # Persistent mode must be dispatched BEFORE any one-shot input handling:
+    # it is spawned without --input/--output and serves batches via stdin.
+    if getattr(args, "persistent", False):
+        return persistent_main(args)
     try:
         with open(args.input) as f:
             data = json.load(f)
@@ -65,9 +69,6 @@ def main():
         if it["text"].strip() == "":
             print(json.dumps({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "level": "ERROR", "component": "embedding", "msg": f"empty text for id {it['id']}"}), file=sys.stderr, flush=True)
             sys.exit(2)
-
-    if getattr(args, "persistent", False):
-        return persistent_main(args)
 
     if not args.input or not args.output:
         print(json.dumps({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "level": "ERROR", "component": "embedding", "msg": "FATAL: --input and --output required in one-shot mode"}), file=sys.stderr, flush=True)
