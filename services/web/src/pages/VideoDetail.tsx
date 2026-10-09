@@ -1,8 +1,52 @@
 import { useEffect, useState, useRef } from 'react'
-import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { useParams, Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { client } from '../api/client'
 import { useDialog } from '../components/Dialog'
 import type { Video, MediaMetadata, Segment, Frame, Detection, Track, Event, SegmentDescription } from '../api/types'
+
+function highlightMatched(text: string, matchedText: string) {
+  if (!text || !matchedText.trim()) return text
+  let idx = text.indexOf(matchedText)
+  let len = matchedText.length
+  if (idx === -1) {
+    const ci = text.toLowerCase().indexOf(matchedText.toLowerCase())
+    if (ci === -1) return text
+    idx = ci
+    len = matchedText.length
+  }
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark style={{ background: '#fef08a', color: '#422006', padding: '0 2px', borderRadius: 3, fontWeight: 600 }}>
+        {text.slice(idx, idx + len)}
+      </mark>
+      {text.slice(idx + len)}
+    </>
+  )
+}
+
+function highlightQuery(text: string, query: string) {
+  if (!text || !query.trim()) return text
+  const tokens = query.toLowerCase().split(/\s+/).map(t => t.replace(/[^a-z0-9]/g, '')).filter(t => t.length >= 3)
+  if (tokens.length === 0) return text
+  // Find earliest token hit and highlight that span.
+  const lower = text.toLowerCase()
+  let best = -1, bestTok = ''
+  for (const tok of tokens) {
+    const i = lower.indexOf(tok)
+    if (i !== -1 && (best === -1 || i < best)) { best = i; bestTok = tok }
+  }
+  if (best === -1) return text
+  return (
+    <>
+      {text.slice(0, best)}
+      <mark style={{ background: '#fef08a', color: '#422006', padding: '0 2px', borderRadius: 3, fontWeight: 600 }}>
+        {text.slice(best, best + bestTok.length)}
+      </mark>
+      {text.slice(best + bestTok.length)}
+    </>
+  )
+}
 
 function formatDur(sec: number) {
   if (!isFinite(sec) || sec < 0) sec = 0
@@ -13,7 +57,18 @@ function formatDur(sec: number) {
 export default function VideoDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const location = useLocation() as any
+  const deepSegment = searchParams.get('segment')
+  const deepQuery = searchParams.get('q') || ''
+  const deepSim = searchParams.get('sim') || ''
+  const deepFrom = searchParams.get('from') || ''
+  const deepMatch = searchParams.get('match') || ''
+  const navResult = location?.state?.searchResult as any | undefined
+  const navMatch: string = navResult?.matched_text || ''
+  // Exact snippet from search — URL param survives reload, nav state is fast path.
+  const matchedSnippet = deepMatch || navMatch || ''
+  const isDeepLink = !!deepSegment
   const videoRef = useRef<HTMLVideoElement>(null)
   const [video, setVideo] = useState<Video | null>(null)
   const [media, setMedia] = useState<MediaMetadata | null>(null)
@@ -69,7 +124,54 @@ export default function VideoDetail() {
     } catch (e: any) { setErr(e.message) }
   }
 
-  useEffect(() => { fetchAll() }, [id])
+  const fetchEvidence = async (segmentId: string) => {
+    if (!id) return
+    try {
+      const v = await client.get<Video>(`/api/v1/videos/${id}`)
+      setVideo(v)
+      try { setMedia(await client.get<MediaMetadata>(`/api/v1/videos/${id}/media`)) } catch { setMedia(null) }
+      try { setSegments(await client.get<Segment[]>(`/api/v1/videos/${id}/segments`)) } catch { setSegments([]) }
+      // Scoped evidence: single bounded request instead of full-video fan-out.
+      const ev: any = await client.get(`/api/v1/videos/${id}/segments/${segmentId}/evidence`)
+      setFrames(ev.frames || [])
+      setDetections(ev.detections || [])
+      const scopedTracks: Track[] = ev.tracks || []
+      setTracks(scopedTracks)
+      setEvents(ev.events || [])
+      if (ev.description) setDescriptions([ev.description])
+      else { try { setDescriptions(await client.get<SegmentDescription[]>(`/api/v1/videos/${id}/descriptions`)) } catch { setDescriptions([]) } }
+      // Track→detection links only for scoped tracks (bounded, not whole video).
+      const map: Record<string, number> = {}
+      await Promise.all(scopedTracks.slice(0, 20).map(async (tr) => {
+        try {
+          const links: any[] = await client.get<any[]>(`/api/v1/tracks/${tr.id}/detections`)
+          links.forEach((l: any) => { map[l.detection_id] = tr.track_index })
+        } catch {}
+      }))
+      setDetToTrack(map)
+      setFilterSegmentId(segmentId)
+      setActiveTab('descriptions')
+      setAnalysisCollapsed(false)
+      setErr(null)
+    } catch (e: any) {
+      // Fall back to full fetch if evidence endpoint fails.
+      await fetchAll()
+      setFilterSegmentId(segmentId)
+    }
+  }
+
+  useEffect(() => {
+    if (deepSegment) fetchEvidence(deepSegment)
+    else fetchAll()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id])
+
+  const clearDeepLink = () => {
+    setFilterSegmentId(null)
+    setSearchParams({}, { replace: true })
+    navigate(`/videos/${id}`, { replace: true })
+    fetchAll()
+  }
   useEffect(() => {
     const tStr = searchParams.get('t')
     if (tStr == null) return
@@ -177,6 +279,13 @@ export default function VideoDetail() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div>
         <Link to="/videos" style={{ fontSize: 11, color: 'var(--muted)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>← Back to videos</Link>
+        {(isDeepLink || filterSegmentId) && activeSegment && (
+          <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: '#fefce8', border: '1px solid #fde68a', borderRadius: 8, fontSize: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 700 }}>Matched {deepQuery ? `"${deepQuery}"` : 'segment'}{deepSim ? ` (${deepSim}%)` : ''}{navResult?.similarity && !deepSim ? ` (${Math.round(navResult.similarity * 100)}%)` : ''}</span>
+            <span style={{ color: 'var(--muted)' }}>• Segment #{activeSegment.segment_index} {formatDur(activeSegment.start_time)}–{formatDur(activeSegment.end_time)}{deepFrom ? ` • from ${deepFrom} search` : ''} • showing only this segment</span>
+            <button className="btn" onClick={clearDeepLink} style={{ marginLeft: 'auto', padding: '4px 8px', fontSize: 11, background: 'white' }}>Show full video ✕</button>
+          </div>
+        )}
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 4, gap: 12 }}>
           <div>
             <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 4px 0', letterSpacing: -0.02 }}>{video.filename}</h1>
@@ -488,8 +597,12 @@ export default function VideoDetail() {
                         const timeLabel = seg ? `${fmtTime(seg.start_time)} → ${fmtTime(seg.end_time)}` : d.segment_id.slice(0, 8)
                         return (
                           <div key={d.id} style={{ padding: 12, background: '#f8f9f8', border: '1px solid var(--border)', borderRadius: 8, cursor: seg ? 'pointer' : 'default' }} onClick={() => { if (!seg) return; seekTo(seg.start_time); setActiveTab('segments'); const el = document.getElementById(`seg-row-${seg.id}`); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }) }} title={seg ? `Click to play from ${formatDur(seg.start_time)}` : undefined}>
-                            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{timeLabel} — Segment {seg?.segment_index ?? '?'} • {seg ? formatDur(seg.start_time) : ''} ▶</div>
-                            <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap', color: 'var(--text)' }}>{d.description}</div>
+                            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{timeLabel} — Segment {seg?.segment_index ?? '?'} • {seg ? formatDur(seg.start_time) : ''} ▶{(isDeepLink || filterSegmentId) && <span style={{ marginLeft: 6, background: '#fef08a', padding: '0 4px', borderRadius: 3, fontWeight: 700 }}>MATCHED</span>}</div>
+                            <div style={{ fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap', color: 'var(--text)' }}>
+                              {(isDeepLink || filterSegmentId) && matchedSnippet
+                                ? highlightMatched(d.description, matchedSnippet)
+                                : (isDeepLink && deepQuery) ? highlightQuery(d.description, deepQuery) : d.description}
+                            </div>
                             <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 6 }}>Model: {d.model_name} </div>
                           </div>
                         )

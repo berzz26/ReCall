@@ -4,12 +4,22 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/berzz26/recall/services/api/internal/embedding"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	// Bounds keep per-hit payloads small. List views use summary mode and
+	// never pay for full arrays; full mode is capped for the evidence view.
+	maxTracksPerResult = 20
+	maxEventsPerResult = 50
+	// maxConcurrentEnrich bounds DB fan-out per search.
+	maxConcurrentEnrich = 6
 )
 
 type Service struct {
@@ -55,12 +65,23 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 	if limit < 1 || limit > s.maxLimit {
 		return nil, fmt.Errorf("limit must be between 1 and %d", s.maxLimit)
 	}
+	offset := req.Offset
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
 	if req.VideoID != nil {
 		if *req.VideoID == uuid.Nil {
 			return nil, fmt.Errorf("invalid video_id")
 		}
 	}
-	// 1. Generate query embedding
+	detail := req.Detail
+	if detail == "" {
+		detail = DetailSummary
+	}
+	if detail != DetailSummary && detail != DetailFull {
+		return nil, fmt.Errorf("detail must be summary or full")
+	}
+	// 1. Generate query embedding (persistent worker when available).
 	vec, err := s.embedder.EmbedQuery(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to embed query: %w", err)
@@ -68,23 +89,49 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 	if len(vec) != 384 {
 		return nil, fmt.Errorf("invalid query embedding dimension %d", len(vec))
 	}
-	// 2. Retrieve candidates (bounded)
-	candidates, err := s.segmentEmbeddingRepo.SearchSimilar(ctx, vec, s.candidateLimit, req.VideoID)
+	// 2. Retrieve candidates (bounded). Fetch enough to cover offset+limit
+	// after similarity filtering; candidateLimit is the recall pool cap.
+	fetchN := s.candidateLimit
+	if fetchN < offset+limit {
+		fetchN = offset + limit
+	}
+	candidates, err := s.segmentEmbeddingRepo.SearchSimilar(ctx, vec, fetchN, req.VideoID)
 	if err != nil {
 		return nil, fmt.Errorf("semantic retrieval failed: %w", err)
 	}
-	// 3. Apply threshold, preserve ranking (already descending similarity)
+	// 3. Apply threshold, preserve ranking (already descending similarity).
 	var filtered []segment_embedding.SearchResult
 	for _, c := range candidates {
 		if c.Similarity >= s.minSimilarity {
 			filtered = append(filtered, c)
 		}
 	}
-	// 4. Enrich and truncate to requested limit
-	var results []SearchResult
-	for _, c := range filtered {
-		if len(results) >= limit {
-			break
+	// 4. Paginate, then enrich concurrently (bounded).
+	if offset >= len(filtered) {
+		return []SearchResult{}, nil
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	page := filtered[offset:end]
+
+	// Batch: filenames + summary counts in a fixed number of queries,
+	// independent of page size (no N+1).
+	names, err := s.batchFilenames(ctx, distinctVideoIDs(page))
+	if err != nil {
+		return nil, err
+	}
+	summaries, err := s.batchSummaries(ctx, page)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SearchResult, len(page))
+	for i, c := range page {
+		sum := summaries[c.Embedding.SegmentID]
+		if sum == nil {
+			sum = &segSummary{counts: map[string]int{}}
 		}
 		r := SearchResult{
 			VideoID:     c.Embedding.VideoID,
@@ -98,39 +145,316 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 			Tracks:      []TrackInfo{},
 			Events:      []EventInfo{},
 		}
-		// video filename enrichment
-		if s.videoRepo != nil {
-			v, err := s.videoRepo.GetByID(ctx, c.Embedding.VideoID)
-			if err != nil {
-				return nil, fmt.Errorf("video enrichment failed: %w", err)
+		if fn, ok := names[c.Embedding.VideoID]; ok {
+			r.Filename = fn
+			r.VideoName = fn
+		} else if s.videoRepo != nil {
+			// Fallback for any missing name (should not happen).
+			if v, verr := s.videoRepo.GetByID(ctx, c.Embedding.VideoID); verr == nil {
+				r.Filename = v.Filename
+				r.VideoName = v.Filename
 			}
-			r.Filename = v.Filename
-			r.VideoName = v.Filename
 		}
-		// detections enrichment: distinct label, max confidence per label
-		dets, err := s.enrichDetections(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime)
-		if err != nil {
-			return nil, err
+		r.DetectionCounts = sum.counts
+		r.TrackCount = sum.trackCount
+		r.EventCount = sum.eventCount
+		r.ThumbnailFrameID = sum.thumb
+		results[i] = r
+	}
+	if detail == DetailFull {
+		// Full arrays are inherently per-segment; bounded + concurrent.
+		// Counts/thumbnails above are already batched.
+		sem := make(chan struct{}, maxConcurrentEnrich)
+		var wg sync.WaitGroup
+		errs := make([]error, len(page))
+		for i, c := range page {
+			i, c := i, c
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx.Done():
+					errs[i] = ctx.Err()
+					return
+				}
+				dets, derr := s.enrichDetections(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime)
+				if derr != nil {
+					errs[i] = derr
+					return
+				}
+				tracks, ttrunc, terr := s.enrichTracksBounded(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime, maxTracksPerResult)
+				if terr != nil {
+					errs[i] = terr
+					return
+				}
+				events, etrunc, eerr := s.enrichEventsBounded(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime, maxEventsPerResult)
+				if eerr != nil {
+					errs[i] = eerr
+					return
+				}
+				results[i].Detections = dets
+				results[i].Tracks = tracks
+				results[i].Events = events
+				results[i].TracksTruncated = ttrunc
+				results[i].EventsTruncated = etrunc
+			}()
 		}
-		r.Detections = dets
-		// tracks enrichment
-		tracks, err := s.enrichTracks(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime)
-		if err != nil {
-			return nil, err
+		wg.Wait()
+		for _, e := range errs {
+			if e != nil {
+				return nil, e
+			}
 		}
-		r.Tracks = tracks
-		// events enrichment
-		events, err := s.enrichEvents(ctx, c.Embedding.VideoID, c.StartTime, c.EndTime)
-		if err != nil {
-			return nil, err
-		}
-		r.Events = events
-		results = append(results, r)
 	}
 	if results == nil {
 		results = []SearchResult{}
 	}
 	return results, nil
+}
+
+// segSummary is the batched per-segment summary (fixed query count).
+type segSummary struct {
+	counts     map[string]int
+	trackCount int
+	eventCount int
+	thumb      *uuid.UUID
+}
+
+func distinctVideoIDs(page []segment_embedding.SearchResult) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{}, len(page))
+	out := make([]uuid.UUID, 0, len(page))
+	for _, c := range page {
+		if _, ok := seen[c.Embedding.VideoID]; !ok {
+			seen[c.Embedding.VideoID] = struct{}{}
+			out = append(out, c.Embedding.VideoID)
+		}
+	}
+	return out
+}
+
+// batchFilenames resolves all video filenames in one query.
+func (s *Service) batchFilenames(ctx context.Context, vids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := make(map[uuid.UUID]string, len(vids))
+	if len(vids) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, filename FROM videos WHERE id = ANY($1)`, vids)
+	if err != nil {
+		return nil, fmt.Errorf("video enrichment failed: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var fn string
+		if err := rows.Scan(&id, &fn); err != nil {
+			return nil, fmt.Errorf("video enrichment scan failed: %w", err)
+		}
+		out[id] = fn
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("video enrichment failed: %w", err)
+	}
+	return out, nil
+}
+
+// batchSummaries computes detection/track/event counts + thumbnails for the
+// whole page in 4 queries total, regardless of page size.
+func (s *Service) batchSummaries(ctx context.Context, page []segment_embedding.SearchResult) (map[uuid.UUID]*segSummary, error) {
+	out := make(map[uuid.UUID]*segSummary, len(page))
+	for _, c := range page {
+		out[c.Embedding.SegmentID] = &segSummary{counts: map[string]int{}}
+	}
+	if len(page) == 0 {
+		return out, nil
+	}
+	segIDs := make([]uuid.UUID, len(page))
+	vids := make([]uuid.UUID, len(page))
+	starts := make([]float64, len(page))
+	ends := make([]float64, len(page))
+	for i, c := range page {
+		segIDs[i] = c.Embedding.SegmentID
+		vids[i] = c.Embedding.VideoID
+		starts[i] = c.StartTime
+		ends[i] = c.EndTime
+	}
+	// 1. Detection counts per segment window.
+	rows, err := s.db.Query(ctx, `
+		SELECT w.seg_id, d.label, COUNT(*)::int
+		FROM (
+			SELECT unnest($1::uuid[]) AS seg_id, unnest($2::uuid[]) AS vid,
+			       unnest($3::float8[]) AS s, unnest($4::float8[]) AS e
+		) w
+		JOIN video_frames f ON f.video_id = w.vid
+		  AND f.timestamp_seconds >= w.s AND f.timestamp_seconds < w.e
+		JOIN video_frame_detections d ON d.frame_id = f.id AND d.video_id = w.vid
+		GROUP BY w.seg_id, d.label
+	`, segIDs, vids, starts, ends)
+	if err != nil {
+		return nil, fmt.Errorf("detection summary failed: %w", err)
+	}
+	for rows.Next() {
+		var segID uuid.UUID
+		var label string
+		var n int
+		if err := rows.Scan(&segID, &label, &n); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("detection summary scan failed: %w", err)
+		}
+		if sum, ok := out[segID]; ok {
+			sum.counts[label] = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("detection summary failed: %w", err)
+	}
+	// 2. Track counts per segment window (overlap).
+	rows, err = s.db.Query(ctx, `
+		SELECT w.seg_id, COUNT(vt.id)::int
+		FROM (
+			SELECT unnest($1::uuid[]) AS seg_id, unnest($2::uuid[]) AS vid,
+			       unnest($3::float8[]) AS s, unnest($4::float8[]) AS e
+		) w
+		LEFT JOIN video_tracks vt ON vt.video_id = w.vid
+		  AND vt.start_timestamp < w.e AND vt.end_timestamp > w.s
+		GROUP BY w.seg_id
+	`, segIDs, vids, starts, ends)
+	if err != nil {
+		return nil, fmt.Errorf("track summary failed: %w", err)
+	}
+	for rows.Next() {
+		var segID uuid.UUID
+		var n int
+		if err := rows.Scan(&segID, &n); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("track summary scan failed: %w", err)
+		}
+		if sum, ok := out[segID]; ok {
+			sum.trackCount = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("track summary failed: %w", err)
+	}
+	// 3. Event counts per segment window (fixed predicate: point events
+	// must start inside; ranged use overlap).
+	rows, err = s.db.Query(ctx, `
+		SELECT w.seg_id, COUNT(ve.id)::int
+		FROM (
+			SELECT unnest($1::uuid[]) AS seg_id, unnest($2::uuid[]) AS vid,
+			       unnest($3::float8[]) AS s, unnest($4::float8[]) AS e
+		) w
+		LEFT JOIN video_events ve ON ve.video_id = w.vid AND (
+		  (ve.end_timestamp IS NULL AND ve.start_timestamp >= w.s AND ve.start_timestamp < w.e)
+		  OR (ve.end_timestamp IS NOT NULL AND ve.start_timestamp < w.e AND ve.end_timestamp > w.s)
+		)
+		GROUP BY w.seg_id
+	`, segIDs, vids, starts, ends)
+	if err != nil {
+		return nil, fmt.Errorf("event summary failed: %w", err)
+	}
+	for rows.Next() {
+		var segID uuid.UUID
+		var n int
+		if err := rows.Scan(&segID, &n); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("event summary scan failed: %w", err)
+		}
+		if sum, ok := out[segID]; ok {
+			sum.eventCount = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("event summary failed: %w", err)
+	}
+	// 4. Thumbnails: earliest frame per segment.
+	rows, err = s.db.Query(ctx, `
+		SELECT DISTINCT ON (segment_id) segment_id, id
+		FROM video_frames WHERE segment_id = ANY($1)
+		ORDER BY segment_id, timestamp_seconds ASC
+	`, segIDs)
+	if err != nil {
+		return nil, fmt.Errorf("thumbnail lookup failed: %w", err)
+	}
+	for rows.Next() {
+		var segID, fid uuid.UUID
+		if err := rows.Scan(&segID, &fid); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("thumbnail scan failed: %w", err)
+		}
+		if sum, ok := out[segID]; ok {
+			c := fid
+			sum.thumb = &c
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("thumbnail lookup failed: %w", err)
+	}
+	return out, nil
+}
+
+// enrichSummary returns cheap counts + a thumbnail frame without full arrays.
+func (s *Service) enrichSummary(ctx context.Context, videoID, segmentID uuid.UUID, segStart, segEnd float64) (map[string]int, int, int, *uuid.UUID, error) {
+	counts := map[string]int{}
+	// Detection counts per label within segment time range.
+	rows, err := s.db.Query(ctx, `
+		SELECT label, COUNT(*)::int
+		FROM video_frame_detections d
+		JOIN video_frames f ON f.id = d.frame_id
+		WHERE d.video_id = $1
+		  AND f.timestamp_seconds >= $2
+		  AND f.timestamp_seconds < $3
+		GROUP BY label
+	`, videoID, segStart, segEnd)
+	if err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("detection summary failed: %w", err)
+	}
+	for rows.Next() {
+		var label string
+		var n int
+		if err := rows.Scan(&label, &n); err != nil {
+			rows.Close()
+			return nil, 0, 0, nil, fmt.Errorf("detection summary scan failed: %w", err)
+		}
+		counts[label] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("detection summary failed: %w", err)
+	}
+	var trackCount int
+	if err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*)::int FROM video_tracks
+		WHERE video_id = $1 AND start_timestamp < $3 AND end_timestamp > $2
+	`, videoID, segStart, segEnd).Scan(&trackCount); err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("track summary failed: %w", err)
+	}
+	var eventCount int
+	if err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*)::int FROM video_events
+		WHERE video_id = $1 AND (
+		  (end_timestamp IS NULL AND start_timestamp >= $2 AND start_timestamp < $3)
+		  OR (end_timestamp IS NOT NULL AND start_timestamp < $3 AND end_timestamp > $2)
+		)
+	`, videoID, segStart, segEnd).Scan(&eventCount); err != nil {
+		return nil, 0, 0, nil, fmt.Errorf("event summary failed: %w", err)
+	}
+	// Thumbnail: earliest frame in segment (by segment_id when available).
+	var thumb *uuid.UUID
+	var thumbID uuid.UUID
+	err = s.db.QueryRow(ctx, `
+		SELECT id FROM video_frames WHERE segment_id = $1
+		ORDER BY timestamp_seconds ASC LIMIT 1
+	`, segmentID).Scan(&thumbID)
+	if err == nil {
+		thumb = &thumbID
+	}
+	return counts, trackCount, eventCount, thumb, nil
 }
 
 func extractMatchedText(query, description string) string {
@@ -244,54 +568,76 @@ func (s *Service) enrichDetections(ctx context.Context, videoID uuid.UUID, segSt
 	return out, nil
 }
 
-func (s *Service) enrichTracks(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64) ([]TrackInfo, error) {
+// enrichTracksBounded returns overlapping tracks ranked by overlap duration,
+// capped at maxN. truncated=true when more exist than returned.
+func (s *Service) enrichTracksBounded(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64, maxN int) ([]TrackInfo, bool, error) {
+	if maxN <= 0 {
+		maxN = maxTracksPerResult
+	}
 	query := `
-		SELECT id, label, start_timestamp, end_timestamp
+		SELECT id, label, start_timestamp, end_timestamp,
+		       LEAST(end_timestamp, $3) - GREATEST(start_timestamp, $2) AS overlap
 		FROM video_tracks
 		WHERE video_id = $1
 		  AND start_timestamp < $3
 		  AND end_timestamp > $2
-		ORDER BY start_timestamp ASC
+		ORDER BY overlap DESC, start_timestamp ASC
+		LIMIT $4
 	`
-	rows, err := s.db.Query(ctx, query, videoID, segStart, segEnd)
+	rows, err := s.db.Query(ctx, query, videoID, segStart, segEnd, maxN+1)
 	if err != nil {
-		return nil, fmt.Errorf("track enrichment failed: %w", err)
+		return nil, false, fmt.Errorf("track enrichment failed: %w", err)
 	}
 	defer rows.Close()
 	var out []TrackInfo
 	for rows.Next() {
 		var id uuid.UUID
 		var label string
-		var st, et float64
-		if err := rows.Scan(&id, &label, &st, &et); err != nil {
-			return nil, fmt.Errorf("track enrichment scan failed: %w", err)
+		var st, et, overlap float64
+		if err := rows.Scan(&id, &label, &st, &et, &overlap); err != nil {
+			return nil, false, fmt.Errorf("track enrichment scan failed: %w", err)
 		}
 		out = append(out, TrackInfo{TrackID: id, Label: label, StartTime: st, EndTime: et})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("track enrichment failed: %w", err)
+		return nil, false, fmt.Errorf("track enrichment failed: %w", err)
+	}
+	truncated := len(out) > maxN
+	if truncated {
+		out = out[:maxN]
 	}
 	if out == nil {
 		out = []TrackInfo{}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
-func (s *Service) enrichEvents(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64) ([]EventInfo, error) {
+func (s *Service) enrichTracks(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64) ([]TrackInfo, error) {
+	out, _, err := s.enrichTracksBounded(ctx, videoID, segStart, segEnd, maxTracksPerResult)
+	return out, err
+}
+
+// enrichEventsBounded fixes the point-event leak: APPEARED/DISAPPEARED with
+// NULL end must fall inside [segStart, segEnd); only ranged PRESENT/MOVED
+// use overlap. Capped at maxN, truncated flag when more exist.
+func (s *Service) enrichEventsBounded(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64, maxN int) ([]EventInfo, bool, error) {
+	if maxN <= 0 {
+		maxN = maxEventsPerResult
+	}
 	query := `
 		SELECT id, event_type, label, start_timestamp, end_timestamp, confidence
 		FROM video_events
 		WHERE video_id = $1
 		  AND (
-			(start_timestamp < $3 AND (end_timestamp IS NULL OR end_timestamp > $2))
-			OR (start_timestamp >= $2 AND start_timestamp < $3)
+		    (end_timestamp IS NULL AND start_timestamp >= $2 AND start_timestamp < $3)
+		    OR (end_timestamp IS NOT NULL AND start_timestamp < $3 AND end_timestamp > $2)
 		  )
 		ORDER BY start_timestamp ASC
+		LIMIT $4
 	`
-	// Dedup by id (query already distinct per row)
-	rows, err := s.db.Query(ctx, query, videoID, segStart, segEnd)
+	rows, err := s.db.Query(ctx, query, videoID, segStart, segEnd, maxN+1)
 	if err != nil {
-		return nil, fmt.Errorf("event enrichment failed: %w", err)
+		return nil, false, fmt.Errorf("event enrichment failed: %w", err)
 	}
 	defer rows.Close()
 	seen := make(map[uuid.UUID]bool)
@@ -303,7 +649,7 @@ func (s *Service) enrichEvents(ctx context.Context, videoID uuid.UUID, segStart,
 		var et *float64
 		var conf *float64
 		if err := rows.Scan(&id, &eventType, &label, &st, &et, &conf); err != nil {
-			return nil, fmt.Errorf("event enrichment scan failed: %w", err)
+			return nil, false, fmt.Errorf("event enrichment scan failed: %w", err)
 		}
 		if seen[id] {
 			continue
@@ -312,10 +658,19 @@ func (s *Service) enrichEvents(ctx context.Context, videoID uuid.UUID, segStart,
 		out = append(out, EventInfo{EventID: id, EventType: eventType, Label: label, StartTime: st, EndTime: et, Confidence: conf})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("event enrichment failed: %w", err)
+		return nil, false, fmt.Errorf("event enrichment failed: %w", err)
+	}
+	truncated := len(out) > maxN
+	if truncated {
+		out = out[:maxN]
 	}
 	if out == nil {
 		out = []EventInfo{}
 	}
-	return out, nil
+	return out, truncated, nil
+}
+
+func (s *Service) enrichEvents(ctx context.Context, videoID uuid.UUID, segStart, segEnd float64) ([]EventInfo, error) {
+	out, _, err := s.enrichEventsBounded(ctx, videoID, segStart, segEnd, maxEventsPerResult)
+	return out, err
 }

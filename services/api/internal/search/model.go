@@ -4,15 +4,28 @@ import (
 	"github.com/google/uuid"
 )
 
+// DetailLevel controls how much evidence rides on each search hit.
+// "summary" (default) returns counts only — cheap list rendering.
+// "full" returns detections/tracks/events arrays (legacy, heavier).
+type DetailLevel string
+
+const (
+	DetailSummary DetailLevel = "summary"
+	DetailFull    DetailLevel = "full"
+)
+
 type SearchRequest struct {
 	Query   string     `json:"query"`
 	Limit   int        `json:"limit,omitempty"`
+	Offset  int        `json:"offset,omitempty"`
 	VideoID *uuid.UUID `json:"video_id,omitempty"`
+	Detail  DetailLevel `json:"detail,omitempty"`
 }
 
 type SearchResponse struct {
 	Query   string         `json:"query"`
 	Results []SearchResult `json:"results"`
+	Total   int            `json:"total,omitempty"`
 }
 
 type SearchResult struct {
@@ -28,6 +41,14 @@ type SearchResult struct {
 	Detections  []DetectionInfo `json:"detections"`
 	Tracks      []TrackInfo     `json:"tracks"`
 	Events      []EventInfo     `json:"events"`
+	// Summary-only fields (populated in both modes, cheap to compute).
+	DetectionCounts map[string]int `json:"detection_counts,omitempty"`
+	TrackCount      int            `json:"track_count,omitempty"`
+	EventCount      int            `json:"event_count,omitempty"`
+	ThumbnailFrameID *uuid.UUID    `json:"thumbnail_frame_id,omitempty"`
+	// Truncation flags for full mode.
+	TracksTruncated bool `json:"tracks_truncated,omitempty"`
+	EventsTruncated bool `json:"events_truncated,omitempty"`
 }
 
 type DetectionInfo struct {
