@@ -21,7 +21,9 @@ func NewUnifiedSearchHandler(svc *search.Service) *UnifiedSearchHandler {
 type unifiedSearchRequest struct {
 	Query   string  `json:"query"`
 	Limit   *int    `json:"limit,omitempty"`
+	Offset  *int    `json:"offset,omitempty"`
 	VideoID *string `json:"video_id,omitempty"`
+	Detail  *string `json:"detail,omitempty"`
 }
 
 func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
@@ -47,6 +49,13 @@ func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "limit must be <= 50"})
 		}
 	}
+	var offset int
+	if req.Offset != nil {
+		if *req.Offset < 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "offset must be >= 0"})
+		}
+		offset = *req.Offset
+	}
 	var vid *uuid.UUID
 	if req.VideoID != nil && strings.TrimSpace(*req.VideoID) != "" {
 		parsed, err := uuid.Parse(strings.TrimSpace(*req.VideoID))
@@ -55,10 +64,34 @@ func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
 		}
 		vid = &parsed
 	}
+	detail := search.DetailSummary
+	if req.Detail != nil && strings.TrimSpace(*req.Detail) != "" {
+		switch strings.ToLower(strings.TrimSpace(*req.Detail)) {
+		case "summary":
+			detail = search.DetailSummary
+		case "full":
+			detail = search.DetailFull
+		default:
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "detail must be summary or full"})
+		}
+	}
+	// Query-string overrides for deep-links / GET-style callers.
+	if q := strings.TrimSpace(c.Query("detail")); q != "" {
+		switch strings.ToLower(q) {
+		case "summary":
+			detail = search.DetailSummary
+		case "full":
+			detail = search.DetailFull
+		default:
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "detail must be summary or full"})
+		}
+	}
 	searchReq := search.SearchRequest{
 		Query:   query,
 		Limit:   limit,
+		Offset:  offset,
 		VideoID: vid,
+		Detail:  detail,
 	}
 	ctx, cancel := context.WithTimeout(c.UserContext(), 90*time.Second)
 	defer cancel()
@@ -66,7 +99,7 @@ func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
 	if err != nil {
 		// Map validation errors to 400, others to 500
 		msg := err.Error()
-		if strings.Contains(msg, "query is required") || strings.Contains(msg, "limit must be") || strings.Contains(msg, "invalid video_id") {
+		if strings.Contains(msg, "query is required") || strings.Contains(msg, "limit must be") || strings.Contains(msg, "invalid video_id") || strings.Contains(msg, "offset must be") || strings.Contains(msg, "detail must be") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": msg})
 		}
 		if strings.Contains(msg, "failed to embed") || strings.Contains(msg, "invalid query embedding") || strings.Contains(msg, "invalid query vector") {
@@ -89,6 +122,9 @@ func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
 		if results[i].Events == nil {
 			results[i].Events = []search.EventInfo{}
 		}
+		if results[i].DetectionCounts == nil {
+			results[i].DetectionCounts = map[string]int{}
+		}
 	}
-	return c.JSON(search.SearchResponse{Query: query, Results: results})
+	return c.JSON(search.SearchResponse{Query: query, Results: results, Total: len(results)})
 }

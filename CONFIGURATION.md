@@ -160,10 +160,14 @@ when `ENABLE_VIDEO_DESCRIPTION=true`.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `SEARCH_CANDIDATE_LIMIT` | `20` | Embedding recall pool size per query (retrieved, then re-ranked/filtered). Higher = better recall, slower queries. |
+| `SEARCH_CANDIDATE_LIMIT` | `50` | Embedding recall pool size per query (retrieved, then cross-encoder re-ranked, then cut to the requested limit). Higher = better recall, slower queries. |
 | `SEARCH_DEFAULT_LIMIT` | `10` | Results returned when the caller asks for no limit. |
 | `SEARCH_MAX_LIMIT` | `50` | Hard cap on results per request (must be ≥ default limit). |
-| `SEARCH_MIN_SIMILARITY` | `0.35` | Cosine-similarity floor (0–1); hits below this are cut. |
+| `SEARCH_MIN_SIMILARITY` | `0.35` | Cosine-similarity floor (0–1); hits below this are cut before reranking. |
+| `RERANKER_ENABLED` | `true` | Master switch for the cross-encoder reranking stage. `false` keeps pure vector order. |
+| `RERANKER_MODEL` / `RERANKER_MODEL_VERSION` | `mixedbread-ai/mxbai-rerank-xsmall-v1` / `v1` | Cross-encoder id + version tag. Scores (query, full segment description) pairs; higher = more relevant. |
+| `RERANKER_PYTHON_PATH` | `python3` | Interpreter for `workers/rerank/rerank.py`. |
+| `RERANKER_TIMEOUT` | `2m` | Kill a hung rerank batch after this long (falls back to vector order, never fails the search). |
 
 ## 9. Frontend (`services/web/.env`)
 

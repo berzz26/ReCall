@@ -19,6 +19,7 @@ import (
 	local_source "github.com/berzz26/recall/services/api/internal/local_source"
 	"github.com/berzz26/recall/services/api/internal/playable"
 	"github.com/berzz26/recall/services/api/internal/processing"
+	"github.com/berzz26/recall/services/api/internal/rerank"
 	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/search"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
@@ -168,9 +169,12 @@ func main() {
 		slog.Warn("ffmpeg not found, frame extraction will fail", "path", cfg.FFmpegPath, "error", err)
 	}
 
-	// Embedding setup
+	// Embedding setup (B3: persistent worker keeps model resident across
+	// ingest + search queries instead of reloading per call).
 	embedRepo := segment_embedding.NewRepository(db.DB)
 	embedder := embedding.NewBGEEmbedder(cfg.EmbeddingPythonPath, "workers/embedding/embed.py", cfg.EmbeddingTimeout)
+	embedder.StartPersistent(context.Background())
+	defer embedder.Close()
 	embedService := segment_embedding.NewService(embedRepo, segmentDescRepo, embedder, cfg.EmbeddingModel, cfg.EmbeddingModelVersion)
 	if cfg.EnableVideoDescription {
 		slog.Info("embedding provider selected", "model", cfg.EmbeddingModel, "version", cfg.EmbeddingModelVersion)
@@ -249,6 +253,15 @@ func main() {
 	}
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
+	if cfg.RerankerEnabled {
+		reranker := rerank.NewCrossEncoderReranker(cfg.RerankerPythonPath, "workers/rerank/rerank.py", cfg.RerankerModel, cfg.RerankerTimeout)
+		reranker.StartPersistent(context.Background())
+		defer reranker.Close()
+		searchService.WithReranker(reranker)
+		slog.Info("reranker enabled", "model", cfg.RerankerModel, "version", cfg.RerankerModelVersion, "candidate_limit", cfg.SearchCandidateLimit)
+	} else {
+		slog.Info("reranker disabled via RERANKER_ENABLED=false; vector order preserved")
+	}
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)
 	worker := processing.NewWorker(videoService, processor, cfg.PollInterval)
 	// Browser-playable proxy (H.264 sidecar) for codecs browsers cannot
@@ -325,6 +338,9 @@ func main() {
 	v1.Get("/tracks/:trackId/events", detailHandler.GetTrackEvents)
 	v1.Get("/videos/:id/descriptions", detailHandler.GetDescriptions)
 	v1.Get("/videos/:id/segments/:segmentId/description", detailHandler.GetSegmentDescription)
+	// B4: scoped evidence for search deep-links (avoids full-video refetch).
+	evidenceHandler := handlers.NewSegmentEvidenceHandler(db.DB, videoSegmentRepo, videoFrameRepo, detectionRepo, trackRepo, eventRepo, segmentDescRepo)
+	v1.Get("/videos/:id/segments/:segmentId/evidence", evidenceHandler.GetEvidence)
 	v1.Post("/ingest/local", videoHandler.IngestLocal)
 	v1.Mount("/local-sources", localSourceHandler.SetupRoutes())
 	v1.Post("/search/semantic", searchHandler.Search)

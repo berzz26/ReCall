@@ -3,6 +3,7 @@ package segment_embedding
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
@@ -169,6 +170,12 @@ func (r *Repository) SearchSimilar(ctx context.Context, queryVec []float32, limi
 	}
 	query += fmt.Sprintf(" ORDER BY e.embedding <=> $1::vector LIMIT $%d", argIdx)
 	args = append(args, limit)
+
+	queryFile := "../search_query.txt"
+	embeddingStr := vectorToString(queryVec)
+	if err := os.WriteFile(queryFile, []byte(embeddingStr), 0644); err != nil {
+		return nil, fmt.Errorf("failed to write search query to file: %w", err)
+	}
 
 	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
