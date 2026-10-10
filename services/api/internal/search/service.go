@@ -3,10 +3,13 @@ package search
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/berzz26/recall/services/api/internal/embedding"
+	"github.com/berzz26/recall/services/api/internal/rerank"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
 	"github.com/berzz26/recall/services/api/internal/video"
 	"github.com/google/uuid"
@@ -24,6 +27,7 @@ const (
 
 type Service struct {
 	embedder             embedding.TextEmbedder
+	reranker             rerank.Reranker
 	segmentEmbeddingRepo *segment_embedding.Repository
 	db                   *pgxpool.Pool
 	videoRepo            *video.Repository
@@ -51,6 +55,13 @@ func NewService(
 		maxLimit:             maxLimit,
 		minSimilarity:        minSimilarity,
 	}
+}
+
+// WithReranker attaches the cross-encoder reranking stage. Nil disables
+// reranking (vector similarity order is preserved). Chainable.
+func (s *Service) WithReranker(r rerank.Reranker) *Service {
+	s.reranker = r
+	return s
 }
 
 func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
@@ -106,6 +117,12 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 			filtered = append(filtered, c)
 		}
 	}
+	// 3b. Cross-encoder reranking stage: score (query, full description)
+	// pairs and reorder descending by relevance. Failures fall back to
+	// vector order so search never hard-fails on reranker errors.
+	// rerankScores maps SegmentID -> relevance; nil when reranking is
+	// disabled or unavailable.
+	filtered, rerankScores := s.rerankCandidates(ctx, query, filtered)
 	// 4. Paginate, then enrich concurrently (bounded).
 	if offset >= len(filtered) {
 		return []SearchResult{}, nil
@@ -128,6 +145,10 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 	}
 
 	results := make([]SearchResult, len(page))
+	// Normalize rerank scores to 0..1 over the FULL reranked pool (not just
+	// this page) so Relevance % is stable across paginated "load more"
+	// fetches. Raw cross-encoder logits are unbounded and not display-safe.
+	rerankMin, rerankMax, hasRerankRange := rerankScoreRange(rerankScores)
 	for i, c := range page {
 		sum := summaries[c.Embedding.SegmentID]
 		if sum == nil {
@@ -144,6 +165,14 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 			Detections:  []DetectionInfo{},
 			Tracks:      []TrackInfo{},
 			Events:      []EventInfo{},
+		}
+		if score, ok := rerankScores[c.Embedding.SegmentID]; ok {
+			s := score
+			r.RerankScore = &s
+			if hasRerankRange {
+				n := normalizeRerankScore(score, rerankMin, rerankMax)
+				r.RerankScoreNormalized = &n
+			}
 		}
 		if fn, ok := names[c.Embedding.VideoID]; ok {
 			r.Filename = fn
@@ -212,6 +241,91 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 		results = []SearchResult{}
 	}
 	return results, nil
+}
+
+// rerankCandidates runs the cross-encoder stage: each candidate's full
+// segment description is scored against the original query and candidates
+// are reordered descending by relevance score. It returns the reordered
+// candidates plus a SegmentID -> score map for response enrichment.
+// When no reranker is configured, when there is nothing (or only one
+// thing) to reorder, or when scoring fails, it returns the input order
+// with a nil score map (fallback preserves vector ranking).
+func (s *Service) rerankCandidates(ctx context.Context, query string, candidates []segment_embedding.SearchResult) ([]segment_embedding.SearchResult, map[uuid.UUID]float64) {
+	if s.reranker == nil || len(candidates) <= 1 {
+		return candidates, nil
+	}
+	docs := make([]string, len(candidates))
+	for i, c := range candidates {
+		docs[i] = c.Description
+	}
+	scores, err := s.reranker.Rerank(ctx, query, docs)
+	if err != nil {
+		slog.Warn("search: reranking failed, keeping vector order", "error", err, "candidates", len(candidates))
+		return candidates, nil
+	}
+	if len(scores) != len(candidates) {
+		slog.Warn("search: reranker score count mismatch, keeping vector order", "scores", len(scores), "candidates", len(candidates))
+		return candidates, nil
+	}
+	type scored struct {
+		idx   int
+		score float64
+	}
+	order := make([]scored, len(candidates))
+	for i, sc := range scores {
+		order[i] = scored{idx: i, score: sc}
+	}
+	// Stable sort descending so ties preserve vector order.
+	sort.SliceStable(order, func(a, b int) bool {
+		return order[a].score > order[b].score
+	})
+	reordered := make([]segment_embedding.SearchResult, len(candidates))
+	scoreMap := make(map[uuid.UUID]float64, len(candidates))
+	for j, o := range order {
+		reordered[j] = candidates[o.idx]
+		scoreMap[candidates[o.idx].Embedding.SegmentID] = o.score
+	}
+	return reordered, scoreMap
+}
+
+// rerankScoreRange returns the min/max over a rerank score map.
+// ok=false when there is nothing to normalize (nil/empty map).
+func rerankScoreRange(scores map[uuid.UUID]float64) (min, max float64, ok bool) {
+	if len(scores) == 0 {
+		return 0, 0, false
+	}
+	first := true
+	for _, s := range scores {
+		if first {
+			min, max = s, s
+			first = false
+			continue
+		}
+		if s < min {
+			min = s
+		}
+		if s > max {
+			max = s
+		}
+	}
+	return min, max, true
+}
+
+// normalizeRerankScore min-max normalizes a raw cross-encoder logit to
+// 0..1 (1 = most relevant in the pool). A degenerate pool where every
+// score is identical normalizes to 1.0.
+func normalizeRerankScore(score, min, max float64) float64 {
+	if max <= min {
+		return 1.0
+	}
+	n := (score - min) / (max - min)
+	if n < 0 {
+		return 0
+	}
+	if n > 1 {
+		return 1
+	}
+	return n
 }
 
 // segSummary is the batched per-segment summary (fixed query count).

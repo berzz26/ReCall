@@ -19,6 +19,7 @@ import (
 	local_source "github.com/berzz26/recall/services/api/internal/local_source"
 	"github.com/berzz26/recall/services/api/internal/playable"
 	"github.com/berzz26/recall/services/api/internal/processing"
+	"github.com/berzz26/recall/services/api/internal/rerank"
 	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/search"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
@@ -252,6 +253,15 @@ func main() {
 	}
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
+	if cfg.RerankerEnabled {
+		reranker := rerank.NewCrossEncoderReranker(cfg.RerankerPythonPath, "workers/rerank/rerank.py", cfg.RerankerModel, cfg.RerankerTimeout)
+		reranker.StartPersistent(context.Background())
+		defer reranker.Close()
+		searchService.WithReranker(reranker)
+		slog.Info("reranker enabled", "model", cfg.RerankerModel, "version", cfg.RerankerModelVersion, "candidate_limit", cfg.SearchCandidateLimit)
+	} else {
+		slog.Info("reranker disabled via RERANKER_ENABLED=false; vector order preserved")
+	}
 	unifiedSearchHandler := handlers.NewUnifiedSearchHandler(searchService)
 	worker := processing.NewWorker(videoService, processor, cfg.PollInterval)
 	// Browser-playable proxy (H.264 sidecar) for codecs browsers cannot

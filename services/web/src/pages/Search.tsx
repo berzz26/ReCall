@@ -13,6 +13,8 @@ interface SearchResult {
   description: string
   matched_text?: string
   similarity: number
+  rerank_score?: number
+  rerank_score_normalized?: number
   detections: { label: string }[]
   tracks: any[]
   events: any[]
@@ -75,7 +77,13 @@ const ResultCard = memo(function ResultCard({ r, onOpen }: { r: SearchResult; qu
         <div className="result-title">{filename} • {formatTimestamp(r.start_time)}</div>
         <div className="result-desc"><HighlightedDescription description={r.description} matchedText={r.matched_text} /></div>
         <div className="result-meta">
-          <span>Similarity {Math.round((r.similarity || 0) * 100)}%</span><span>•</span><span>{formatTimestamp(r.start_time)} - {formatTimestamp(r.end_time)}</span>
+          {r.rerank_score_normalized != null ? (
+            <span title={`Vector similarity ${Math.round((r.similarity || 0) * 100)}% • Cross-encoder relevance ${r.rerank_score != null ? r.rerank_score.toFixed(2) : 'n/a'}`}>
+              Relevance {Math.round(r.rerank_score_normalized * 100)}%
+            </span>
+          ) : (
+            <span>Similarity {Math.round((r.similarity || 0) * 100)}%</span>
+          )}<span>•</span><span>{formatTimestamp(r.start_time)} - {formatTimestamp(r.end_time)}</span>
           {(r.track_count != null || r.event_count != null || countLabels.length > 0) && (
             <>
               <span>•</span>
@@ -135,6 +143,7 @@ export default function Search() {
       sim: String(Math.round((r.similarity || 0) * 100)),
       from: 'search',
     })
+    if (r.rerank_score_normalized != null) params.set('rel', String(Math.round(r.rerank_score_normalized * 100)))
     if (r.matched_text) params.set('match', r.matched_text)
     navigate(`/videos/${r.video_id}?${params.toString()}`, { state: { searchResult: r, query: resultQuery || query.trim() } })
   }

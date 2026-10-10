@@ -38,6 +38,15 @@ type SearchResult struct {
 	Description string          `json:"description"`
 	MatchedText string          `json:"matched_text,omitempty"`
 	Similarity  float64         `json:"similarity"`
+	// RerankScore is the cross-encoder relevance score (higher = more
+	// relevant). Nil when the reranking stage is disabled or unavailable;
+	// Similarity always holds the original vector cosine similarity.
+	RerankScore *float64        `json:"rerank_score,omitempty"`
+	// RerankScoreNormalized is RerankScore min-max normalized to 0..1 over
+	// the full reranked candidate pool for the query (1 = top hit). It is
+	// display-safe, unlike the raw unbounded logit. Nil when RerankScore
+	// is nil.
+	RerankScoreNormalized *float64 `json:"rerank_score_normalized,omitempty"`
 	Detections  []DetectionInfo `json:"detections"`
 	Tracks      []TrackInfo     `json:"tracks"`
 	Events      []EventInfo     `json:"events"`

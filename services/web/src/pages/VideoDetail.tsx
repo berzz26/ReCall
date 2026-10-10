@@ -62,6 +62,7 @@ export default function VideoDetail() {
   const deepSegment = searchParams.get('segment')
   const deepQuery = searchParams.get('q') || ''
   const deepSim = searchParams.get('sim') || ''
+  const deepRel = searchParams.get('rel') || ''
   const deepFrom = searchParams.get('from') || ''
   const deepMatch = searchParams.get('match') || ''
   const navResult = location?.state?.searchResult as any | undefined
@@ -281,7 +282,7 @@ export default function VideoDetail() {
         <Link to="/videos" style={{ fontSize: 11, color: 'var(--muted)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>← Back to videos</Link>
         {(isDeepLink || filterSegmentId) && activeSegment && (
           <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', background: '#fefce8', border: '1px solid #fde68a', borderRadius: 8, fontSize: 12, flexWrap: 'wrap' }}>
-            <span style={{ fontWeight: 700 }}>Matched {deepQuery ? `"${deepQuery}"` : 'segment'}{deepSim ? ` (${deepSim}%)` : ''}{navResult?.similarity && !deepSim ? ` (${Math.round(navResult.similarity * 100)}%)` : ''}</span>
+            <span style={{ fontWeight: 700 }}>Matched {deepQuery ? `"${deepQuery}"` : 'segment'}{deepRel ? ` (relevance ${deepRel}%)` : deepSim ? ` (${deepSim}%)` : navResult?.rerank_score_normalized != null ? ` (relevance ${Math.round(navResult.rerank_score_normalized * 100)}%)` : navResult?.similarity ? ` (${Math.round(navResult.similarity * 100)}%)` : ''}</span>
             <span style={{ color: 'var(--muted)' }}>• Segment #{activeSegment.segment_index} {formatDur(activeSegment.start_time)}–{formatDur(activeSegment.end_time)}{deepFrom ? ` • from ${deepFrom} search` : ''} • showing only this segment</span>
             <button className="btn" onClick={clearDeepLink} style={{ marginLeft: 'auto', padding: '4px 8px', fontSize: 11, background: 'white' }}>Show full video ✕</button>
           </div>

@@ -76,6 +76,11 @@ type Config struct {
 	SearchDefaultLimit     int
 	SearchMaxLimit         int
 	SearchMinSimilarity    float64
+	RerankerEnabled        bool
+	RerankerModel          string
+	RerankerModelVersion   string
+	RerankerPythonPath     string
+	RerankerTimeout        time.Duration
 	EnableVideoDescription bool
 	TrackerType            string
 	TrackerHighThreshold   float64
@@ -601,7 +606,7 @@ func Load() Config {
 		}
 	}
 
-	searchCandidateLimit := 20
+	searchCandidateLimit := 50
 	if v := os.Getenv("SEARCH_CANDIDATE_LIMIT"); v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil || parsed < 1 {
@@ -641,6 +646,38 @@ func Load() Config {
 			panic(fmt.Sprintf("SEARCH_MIN_SIMILARITY must be 0..1, got %s", v))
 		}
 		searchMinSimilarity = parsed
+	}
+
+	rerankerEnabled := true
+	if v := os.Getenv("RERANKER_ENABLED"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			rerankerEnabled = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			rerankerEnabled = false
+		default:
+			panic(fmt.Sprintf("invalid RERANKER_ENABLED %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
+	rerankerModel := os.Getenv("RERANKER_MODEL")
+	if rerankerModel == "" {
+		rerankerModel = "mixedbread-ai/mxbai-rerank-xsmall-v1"
+	}
+	rerankerModelVersion := os.Getenv("RERANKER_MODEL_VERSION")
+	if rerankerModelVersion == "" {
+		rerankerModelVersion = "v1"
+	}
+	rerankerPythonPath := os.Getenv("RERANKER_PYTHON_PATH")
+	if rerankerPythonPath == "" {
+		rerankerPythonPath = "python3"
+	}
+	rerankerTimeout := 2 * time.Minute
+	if v := os.Getenv("RERANKER_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			rerankerTimeout = d
+		} else {
+			panic(fmt.Sprintf("invalid RERANKER_TIMEOUT %q", v))
+		}
 	}
 
 	enableVideoDescription := true
@@ -796,6 +833,11 @@ func Load() Config {
 		SearchDefaultLimit:     searchDefaultLimit,
 		SearchMaxLimit:         searchMaxLimit,
 		SearchMinSimilarity:    searchMinSimilarity,
+		RerankerEnabled:        rerankerEnabled,
+		RerankerModel:          rerankerModel,
+		RerankerModelVersion:   rerankerModelVersion,
+		RerankerPythonPath:     rerankerPythonPath,
+		RerankerTimeout:        rerankerTimeout,
 		EnableVideoDescription: enableVideoDescription,
 		TrackerType:            trackerType,
 		TrackerHighThreshold:   trackerHighThreshold,
