@@ -254,11 +254,25 @@ func main() {
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	if cfg.RerankerEnabled {
-		reranker := rerank.NewCrossEncoderReranker(cfg.RerankerPythonPath, "workers/rerank/rerank.py", cfg.RerankerModel, cfg.RerankerTimeout)
+		reranker := rerank.NewCrossEncoderReranker(rerank.Options{
+			PythonPath:   cfg.RerankerPythonPath,
+			ScriptPath:   "workers/rerank/rerank.py",
+			ModelName:    cfg.RerankerModel,
+			Backend:      cfg.RerankerBackend,
+			Quantization: cfg.RerankerQuantization,
+			ONNXDir:      cfg.RerankerONNXDir,
+			ONNXThreads:  cfg.RerankerONNXThreads,
+			BatchSize:    cfg.RerankerBatchSize,
+			Timeout:      cfg.RerankerTimeout,
+		})
 		reranker.StartPersistent(context.Background())
 		defer reranker.Close()
 		searchService.WithReranker(reranker)
-		slog.Info("reranker enabled", "model", cfg.RerankerModel, "version", cfg.RerankerModelVersion, "candidate_limit", cfg.SearchCandidateLimit)
+		slog.Info("reranker enabled",
+			"model", cfg.RerankerModel, "version", cfg.RerankerModelVersion,
+			"backend", cfg.RerankerBackend, "quantization", cfg.RerankerQuantization,
+			"onnx_dir", cfg.RerankerONNXDir, "batch_size", cfg.RerankerBatchSize,
+			"candidate_limit", cfg.SearchCandidateLimit)
 	} else {
 		slog.Info("reranker disabled via RERANKER_ENABLED=false; vector order preserved")
 	}

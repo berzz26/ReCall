@@ -166,8 +166,51 @@ when `ENABLE_VIDEO_DESCRIPTION=true`.
 | `SEARCH_MIN_SIMILARITY` | `0.35` | Cosine-similarity floor (0–1); hits below this are cut before reranking. |
 | `RERANKER_ENABLED` | `true` | Master switch for the cross-encoder reranking stage. `false` keeps pure vector order. |
 | `RERANKER_MODEL` / `RERANKER_MODEL_VERSION` | `mixedbread-ai/mxbai-rerank-xsmall-v1` / `v1` | Cross-encoder id + version tag. Scores (query, full segment description) pairs; higher = more relevant. |
+| `RERANKER_BACKEND` | `torch` | `torch` (sentence-transformers/PyTorch) or `onnx` (ONNX Runtime CPU). Defaults to PyTorch. |
+| `RERANKER_QUANTIZATION` | `none` | ONNX only: `none` uses FP32, `int8` uses the prepared dynamic-quantized graph. `int8` with `RERANKER_BACKEND=torch` is rejected. |
+| `RERANKER_ONNX_DIR` | `workers/rerank/models/mxbai-rerank-xsmall-v1` | Directory holding the prepared ONNX graph, tokenizer, and `rerank_artifact.json`. |
+| `RERANKER_ONNX_THREADS` | `2` | ONNX Runtime intra-op CPU threads (inter-op is fixed at 1 to avoid oversubscription). |
+| `RERANKER_BATCH_SIZE` | `32` | Candidate pairs scored per inference batch; applies to both backends. |
 | `RERANKER_PYTHON_PATH` | `python3` | Interpreter for `workers/rerank/rerank.py`. |
 | `RERANKER_TIMEOUT` | `2m` | Kill a hung rerank batch after this long (falls back to vector order, never fails the search). |
+
+### ONNX reranker artifacts
+
+The ONNX backend never exports or downloads inside the API process or during a
+search request. `make run` invokes `workers/rerank/prepare_onnx.py --ensure` as
+a separate process before starting the server: it validates the existing
+artifact against the configured model/opset/quantization, skips in ~a second
+when everything matches, and re-exports — including switching between
+`RERANKER_QUANTIZATION=none` and `int8` — when parameters changed. It is
+skipped entirely when `RERANKER_ENABLED != true` or `RERANKER_BACKEND != onnx`.
+Precedence is command line > shell environment > `.env`.
+
+Manual preparation and one-off overriding still work:
+
+```bash
+# FP32 only
+make prepare-rerank
+
+# FP32 + separately selectable INT8 graph for this run
+make prepare-rerank RERANKER_QUANTIZATION=int8
+
+# Plain explicit invocation
+python3 workers/rerank/prepare_onnx.py \
+  --model mixedbread-ai/mxbai-rerank-xsmall-v1 \
+  --output-dir workers/rerank/models/mxbai-rerank-xsmall-v1 \
+  --quantization int8
+```
+
+Install ONNX dependencies with
+`pip install -r workers/rerank/requirements-onnx.txt` using the interpreter in
+`RERANKER_PYTHON_PATH`. The artifact directory is git-ignored. Select the
+backend with `RERANKER_BACKEND=onnx` and precision with
+`RERANKER_QUANTIZATION=none|int8`.
+
+If the artifact is missing, was prepared for a different `RERANKER_MODEL`, or
+fails to initialize, the API still starts; the reranker logs a clear error and
+searches keep pure vector order. It does not fall back to per-request one-shot
+model reloads. See `workers/rerank/README.md` for details.
 
 ## 9. Frontend (`services/web/.env`)
 

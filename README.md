@@ -393,6 +393,8 @@ pgvector similarity search
     ↓
 Find relevant segments
     ↓
+Cross-encoder rerank
+    ↓
 Enrich with detections, tracks and events
     ↓
 Return matching moments
@@ -525,6 +527,7 @@ The ML components are currently invoked as Python processes from the Go processi
 | Vision-language model | SmolVLM2-500M-Video-Instruct |
 | Optional cloud vision | Gemini                       |
 | Embeddings            | BAAI/bge-small-en-v1.5       |
+| Reranker              | mxbai-rerank-xsmall-v1 (PyTorch or ONNX Runtime) |
 | ML workers            | Python                       |
 | Video storage         | Local filesystem             |
 | Deployment            | Docker + Docker Compose      |
@@ -544,6 +547,10 @@ Temporal description
 
 Embeddings
     BAAI/bge-small-en-v1.5
+
+Reranking
+    mixedbread-ai/mxbai-rerank-xsmall-v1
+    PyTorch (default) or ONNX Runtime CPU (optional INT8)
 
 Vector storage
     PostgreSQL + pgvector

@@ -81,3 +81,49 @@ func TestSamplerTimeoutSane(t *testing.T) {
 		t.Fatalf("plan timeout must parse, got %v", cfg.SamplerPlanTimeout)
 	}
 }
+
+func TestRerankerBackendDefaults(t *testing.T) {
+	cfg := Load()
+	if cfg.RerankerBackend != "torch" {
+		t.Fatalf("reranker backend default must be torch, got %q", cfg.RerankerBackend)
+	}
+	if cfg.RerankerQuantization != "none" {
+		t.Fatalf("reranker quantization default must be none, got %q", cfg.RerankerQuantization)
+	}
+	if cfg.RerankerONNXThreads != 2 {
+		t.Fatalf("reranker ONNX threads default must be 2, got %d", cfg.RerankerONNXThreads)
+	}
+	if cfg.RerankerBatchSize != 32 {
+		t.Fatalf("reranker batch size default must be 32, got %d", cfg.RerankerBatchSize)
+	}
+	if cfg.RerankerONNXDir != "workers/rerank/models/mxbai-rerank-xsmall-v1" {
+		t.Fatalf("reranker ONNX dir default mismatch: %q", cfg.RerankerONNXDir)
+	}
+}
+
+func TestRerankerBackendEnv(t *testing.T) {
+	t.Setenv("RERANKER_BACKEND", "onnx")
+	t.Setenv("RERANKER_QUANTIZATION", "int8")
+	t.Setenv("RERANKER_ONNX_DIR", "/tmp/rerank-artifact")
+	t.Setenv("RERANKER_ONNX_THREADS", "3")
+	t.Setenv("RERANKER_BATCH_SIZE", "8")
+	cfg := Load()
+	if cfg.RerankerBackend != "onnx" || cfg.RerankerQuantization != "int8" {
+		t.Fatalf("reranker backend env not parsed: %q %q", cfg.RerankerBackend, cfg.RerankerQuantization)
+	}
+	if cfg.RerankerONNXDir != "/tmp/rerank-artifact" {
+		t.Fatalf("reranker ONNX dir env not parsed: %q", cfg.RerankerONNXDir)
+	}
+	if cfg.RerankerONNXThreads != 3 || cfg.RerankerBatchSize != 8 {
+		t.Fatalf("reranker numeric env not parsed: %d %d", cfg.RerankerONNXThreads, cfg.RerankerBatchSize)
+	}
+}
+
+func TestRerankerBackendInvalid(t *testing.T) {
+	mustPanic(t, "RERANKER_BACKEND", "coreml")
+}
+
+func TestRerankerQuantizationRequiresONNX(t *testing.T) {
+	t.Setenv("RERANKER_BACKEND", "torch")
+	mustPanic(t, "RERANKER_QUANTIZATION", "int8")
+}

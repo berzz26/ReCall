@@ -79,6 +79,11 @@ type Config struct {
 	RerankerEnabled        bool
 	RerankerModel          string
 	RerankerModelVersion   string
+	RerankerBackend        string
+	RerankerQuantization   string
+	RerankerONNXDir        string
+	RerankerONNXThreads    int
+	RerankerBatchSize      int
 	RerankerPythonPath     string
 	RerankerTimeout        time.Duration
 	EnableVideoDescription bool
@@ -667,6 +672,47 @@ func Load() Config {
 	if rerankerModelVersion == "" {
 		rerankerModelVersion = "v1"
 	}
+	rerankerBackend := strings.ToLower(strings.TrimSpace(os.Getenv("RERANKER_BACKEND")))
+	if rerankerBackend == "" {
+		rerankerBackend = "torch"
+	}
+	switch rerankerBackend {
+	case "torch", "onnx":
+	default:
+		panic(fmt.Sprintf("invalid RERANKER_BACKEND %q: must be one of [torch, onnx]", rerankerBackend))
+	}
+	rerankerQuantization := strings.ToLower(strings.TrimSpace(os.Getenv("RERANKER_QUANTIZATION")))
+	if rerankerQuantization == "" {
+		rerankerQuantization = "none"
+	}
+	switch rerankerQuantization {
+	case "none", "int8":
+	default:
+		panic(fmt.Sprintf("invalid RERANKER_QUANTIZATION %q: must be one of [none, int8]", rerankerQuantization))
+	}
+	if rerankerBackend != "onnx" && rerankerQuantization == "int8" {
+		panic("RERANKER_QUANTIZATION=int8 requires RERANKER_BACKEND=onnx")
+	}
+	rerankerONNXDir := os.Getenv("RERANKER_ONNX_DIR")
+	if rerankerONNXDir == "" {
+		rerankerONNXDir = "workers/rerank/models/mxbai-rerank-xsmall-v1"
+	}
+	rerankerONNXThreads := 2
+	if v := os.Getenv("RERANKER_ONNX_THREADS"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 {
+			panic(fmt.Sprintf("invalid RERANKER_ONNX_THREADS %q: must be >= 1", v))
+		}
+		rerankerONNXThreads = parsed
+	}
+	rerankerBatchSize := 32
+	if v := os.Getenv("RERANKER_BATCH_SIZE"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 {
+			panic(fmt.Sprintf("invalid RERANKER_BATCH_SIZE %q: must be >= 1", v))
+		}
+		rerankerBatchSize = parsed
+	}
 	rerankerPythonPath := os.Getenv("RERANKER_PYTHON_PATH")
 	if rerankerPythonPath == "" {
 		rerankerPythonPath = "python3"
@@ -836,6 +882,11 @@ func Load() Config {
 		RerankerEnabled:        rerankerEnabled,
 		RerankerModel:          rerankerModel,
 		RerankerModelVersion:   rerankerModelVersion,
+		RerankerBackend:        rerankerBackend,
+		RerankerQuantization:   rerankerQuantization,
+		RerankerONNXDir:        rerankerONNXDir,
+		RerankerONNXThreads:    rerankerONNXThreads,
+		RerankerBatchSize:      rerankerBatchSize,
 		RerankerPythonPath:     rerankerPythonPath,
 		RerankerTimeout:        rerankerTimeout,
 		EnableVideoDescription: enableVideoDescription,

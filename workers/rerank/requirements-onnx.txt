@@ -1,0 +1,6 @@
+# ONNX backend + artifact preparation dependencies.
+# The torch backend only needs requirements.txt; install this file when
+# RERANKER_BACKEND=onnx or when running prepare_onnx.py.
+-r requirements.txt
+onnx==1.18.0
+onnxruntime==1.23.2
