@@ -15,46 +15,47 @@ const (
 )
 
 type SearchRequest struct {
-	Query   string     `json:"query"`
-	Limit   int        `json:"limit,omitempty"`
-	Offset  int        `json:"offset,omitempty"`
-	VideoID *uuid.UUID `json:"video_id,omitempty"`
+	Query   string      `json:"query"`
+	Limit   int         `json:"limit,omitempty"`
+	Offset  int         `json:"offset,omitempty"`
+	VideoID *uuid.UUID  `json:"video_id,omitempty"`
 	Detail  DetailLevel `json:"detail,omitempty"`
 }
 
 type SearchResponse struct {
-	Query   string         `json:"query"`
-	Results []SearchResult `json:"results"`
-	Total   int            `json:"total,omitempty"`
+	Query      string         `json:"query"`
+	DurationMs int64          `json:"duration_ms"`
+	Results    []SearchResult `json:"results"`
+	Total      int            `json:"total,omitempty"`
 }
 
 type SearchResult struct {
-	VideoID     uuid.UUID       `json:"video_id"`
-	VideoName   string          `json:"video_filename,omitempty"`
-	Filename    string          `json:"filename,omitempty"`
-	SegmentID   uuid.UUID       `json:"segment_id"`
-	StartTime   float64         `json:"start_time"`
-	EndTime     float64         `json:"end_time"`
-	Description string          `json:"description"`
-	MatchedText string          `json:"matched_text,omitempty"`
-	Similarity  float64         `json:"similarity"`
+	VideoID     uuid.UUID `json:"video_id"`
+	VideoName   string    `json:"video_filename,omitempty"`
+	Filename    string    `json:"filename,omitempty"`
+	SegmentID   uuid.UUID `json:"segment_id"`
+	StartTime   float64   `json:"start_time"`
+	EndTime     float64   `json:"end_time"`
+	Description string    `json:"description"`
+	MatchedText string    `json:"matched_text,omitempty"`
+	Similarity  float64   `json:"similarity"`
 	// RerankScore is the cross-encoder relevance score (higher = more
 	// relevant). Nil when the reranking stage is disabled or unavailable;
 	// Similarity always holds the original vector cosine similarity.
-	RerankScore *float64        `json:"rerank_score,omitempty"`
+	RerankScore *float64 `json:"rerank_score,omitempty"`
 	// RerankScoreNormalized is RerankScore min-max normalized to 0..1 over
 	// the full reranked candidate pool for the query (1 = top hit). It is
 	// display-safe, unlike the raw unbounded logit. Nil when RerankScore
 	// is nil.
-	RerankScoreNormalized *float64 `json:"rerank_score_normalized,omitempty"`
-	Detections  []DetectionInfo `json:"detections"`
-	Tracks      []TrackInfo     `json:"tracks"`
-	Events      []EventInfo     `json:"events"`
+	RerankScoreNormalized *float64        `json:"rerank_score_normalized,omitempty"`
+	Detections            []DetectionInfo `json:"detections"`
+	Tracks                []TrackInfo     `json:"tracks"`
+	Events                []EventInfo     `json:"events"`
 	// Summary-only fields (populated in both modes, cheap to compute).
-	DetectionCounts map[string]int `json:"detection_counts,omitempty"`
-	TrackCount      int            `json:"track_count,omitempty"`
-	EventCount      int            `json:"event_count,omitempty"`
-	ThumbnailFrameID *uuid.UUID    `json:"thumbnail_frame_id,omitempty"`
+	DetectionCounts  map[string]int `json:"detection_counts,omitempty"`
+	TrackCount       int            `json:"track_count,omitempty"`
+	EventCount       int            `json:"event_count,omitempty"`
+	ThumbnailFrameID *uuid.UUID     `json:"thumbnail_frame_id,omitempty"`
 	// Truncation flags for full mode.
 	TracksTruncated bool `json:"tracks_truncated,omitempty"`
 	EventsTruncated bool `json:"events_truncated,omitempty"`

@@ -5,9 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/berzz26/recall/services/api/internal/search"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
+	"github.com/berzz26/recall/services/api/internal/search"
 )
 
 type UnifiedSearchHandler struct {
@@ -27,6 +28,7 @@ type unifiedSearchRequest struct {
 }
 
 func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
+	start := time.Now()
 	var req unifiedSearchRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
@@ -126,5 +128,5 @@ func (h *UnifiedSearchHandler) Search(c *fiber.Ctx) error {
 			results[i].DetectionCounts = map[string]int{}
 		}
 	}
-	return c.JSON(search.SearchResponse{Query: query, Results: results, Total: len(results)})
+	return c.JSON(search.SearchResponse{Query: query, DurationMs: time.Since(start).Milliseconds(), Results: results, Total: len(results)})
 }
