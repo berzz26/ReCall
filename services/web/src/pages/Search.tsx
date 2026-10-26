@@ -77,13 +77,14 @@ const ResultCard = memo(function ResultCard({ r, onOpen }: { r: SearchResult; qu
         <div className="result-title">{filename} • {formatTimestamp(r.start_time)}</div>
         <div className="result-desc"><HighlightedDescription description={r.description} matchedText={r.matched_text} /></div>
         <div className="result-meta">
-          {r.rerank_score_normalized != null ? (
+          {/* {r.rerank_score_normalized != null ? (
             <span title={`Vector similarity ${Math.round((r.similarity || 0) * 100)}% • Cross-encoder relevance ${r.rerank_score != null ? r.rerank_score.toFixed(2) : 'n/a'}`}>
               Relevance {Math.round(r.rerank_score_normalized * 100)}%
             </span>
           ) : (
             <span>Similarity {Math.round((r.similarity || 0) * 100)}%</span>
-          )}<span>•</span><span>{formatTimestamp(r.start_time)} - {formatTimestamp(r.end_time)}</span>
+          )} */}
+          <span></span><span>{formatTimestamp(r.start_time)} - {formatTimestamp(r.end_time)}</span>
           {(r.track_count != null || r.event_count != null || countLabels.length > 0) && (
             <>
               <span>•</span>
@@ -174,7 +175,8 @@ export default function Search() {
       <div className="card" style={{ marginTop: 12, padding: '12px 16px' }}>
         <div className="search-meta">
           <div className="search-count">{hasSearched ? `${results?.length ?? 0} results${resultQuery ? ` for "${resultQuery}"` : ''}${videoId ? ` • filtered to ${videos.find(v => v.id === videoId)?.filename || 'video'}` : ''}` : 'Enter a query to search'}</div>
-          <select className="select" defaultValue="relevance"><option>Most relevant</option><option>Newest first</option></select>
+          
+          {/* <select className="select" defaultValue="relevance"><option>Most relevant</option><option>Newest first</option></select> */}
         </div>
 
         {loading && <div style={{ padding: 20, textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Searching…</div>}
