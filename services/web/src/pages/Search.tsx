@@ -25,7 +25,7 @@ interface SearchResult {
   tracks_truncated?: boolean
   events_truncated?: boolean
 }
-interface SearchResponse { query: string; results: SearchResult[]; total?: number }
+interface SearchResponse { query: string; results: SearchResult[]; total?: number; duration_ms?: number }
 
 const PAGE_SIZE = 10
 
@@ -114,6 +114,9 @@ export default function Search() {
   const [error, setError] = useState<string | null>(null)
   const [hasSearched, setHasSearched] = useState(false)
   const [hasMore, setHasMore] = useState(false)
+  // Search latency as reported by the API (duration_ms). On "Load more",
+  // durations accumulate so the figure reflects the whole search session.
+  const [durationMs, setDurationMs] = useState<number | null>(null)
 
   useEffect(() => {
     client.get<Video[]>('/api/v1/videos/').then(v => {
@@ -133,6 +136,7 @@ export default function Search() {
       setResults(prev => (append ? [...(prev || []), ...hits] : hits))
       setResultQuery(res.query)
       setHasMore(hits.length === PAGE_SIZE)
+      setDurationMs(prev => (append ? (prev ?? 0) + (res.duration_ms ?? 0) : (res.duration_ms ?? 0)))
     } catch (e: any) { setError(e.message || 'Search failed. Please try again.'); if (!append) setResults([]) } finally { setLoading(false); setLoadingMore(false) }
   }
 
@@ -175,6 +179,11 @@ export default function Search() {
       <div className="card" style={{ marginTop: 12, padding: '12px 16px' }}>
         <div className="search-meta">
           <div className="search-count">{hasSearched ? `${results?.length ?? 0} results${resultQuery ? ` for "${resultQuery}"` : ''}${videoId ? ` • filtered to ${videos.find(v => v.id === videoId)?.filename || 'video'}` : ''}` : 'Enter a query to search'}</div>
+          {!loading && durationMs != null && hasSearched && (
+            <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto' }}>
+              Search resolved in {durationMs >= 1000 ? `${(durationMs / 1000).toFixed(2)} s` : `${durationMs} ms`}
+            </span>
+          )}
           
           {/* <select className="select" defaultValue="relevance"><option>Most relevant</option><option>Newest first</option></select> */}
         </div>
