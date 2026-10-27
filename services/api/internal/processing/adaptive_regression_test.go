@@ -94,7 +94,7 @@ func invalidTs(x float64) bool {
 // production ByteTrack deterministically (refinement never touches it).
 func runProductionTrackOnce(t *testing.T, ts []float64) {
 	t.Helper()
-	trk, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2)
+	trk, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2, tracker.SparseParams{})
 	if err != nil {
 		t.Fatalf("tracker.New: %v", err)
 	}

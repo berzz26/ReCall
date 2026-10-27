@@ -479,7 +479,7 @@ func TestIntegrationRefinementFlow(t *testing.T) {
 
 	// 8. Production ByteTrack once on the final sequence; planning must not
 	// have mutated it (deterministic re-run matches).
-	prod, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2)
+	prod, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2, tracker.SparseParams{})
 	if err != nil {
 		t.Fatalf("tracker.New: %v", err)
 	}
