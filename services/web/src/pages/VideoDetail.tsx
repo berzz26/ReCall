@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useMemo, type CSSProperties } from 'react'
 import { useParams, Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
 import { client } from '../api/client'
 import { useDialog } from '../components/Dialog'
@@ -54,6 +54,77 @@ function formatDur(sec: number) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
+// One sampled observation of a tracked object. Bounding boxes are normalized
+// (0–1) relative to the video frame, matching the video_frame_detections table.
+type OverlayPoint = { t: number; x: number; y: number; w: number; h: number; label: string; conf: number; held?: boolean }
+type OverlayTrack = { trackIndex: number | null; color: string; pts: OverlayPoint[] }
+
+// Color per object label, shared between the timeline markers and the player overlay.
+function trackColor(label: string): string {
+  const l = (label || '').toLowerCase()
+  if (l === 'person') return '#10a37f'
+  if (['vehicle', 'car', 'truck', 'bus', 'motorcycle', 'bicycle'].includes(l)) return '#3b82f6'
+  if (l) return '#f59e0b'
+  return '#ef4444'
+}
+
+// Detections are only sampled at select timestamps. Within a track's observed
+// range the box is linearly interpolated between consecutive observations; when
+// consecutive observations are farther apart than this, the box is HELD at the
+// last known position (drawn dashed) instead of interpolating guessed motion.
+const MAX_INTERP_GAP = 5
+// Single observations (one-off detections with no track path) stay visible this
+// many seconds around their timestamp instead of flashing for a split second.
+const SINGLETON_WINDOW = 1.5
+
+function interpolateBox(pts: OverlayPoint[], t: number): OverlayPoint | null {
+  if (pts.length === 0) return null
+  const eps = 1e-3
+  const first = pts[0], last = pts[pts.length - 1]
+  // Just outside the observed range: keep the edge box visible briefly (dashed)
+  // so objects don't blink in/out at track boundaries.
+  if (t < first.t - eps) {
+    return t >= first.t - SINGLETON_WINDOW ? { ...first, held: true } : null
+  }
+  if (t > last.t + eps) {
+    return t <= last.t + SINGLETON_WINDOW ? { ...last, held: true } : null
+  }
+  let lo = 0, hi = pts.length - 1
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1
+    if (pts[mid].t <= t) lo = mid
+    else hi = mid
+  }
+  const a = pts[lo]
+  const b = pts[Math.min(lo + 1, pts.length - 1)]
+  if (a === b || b.t - a.t > MAX_INTERP_GAP) {
+    // Single observation (e.g. an untracked detection) or a dead gap: hold the
+    // observed box in place (dashed) instead of guessing motion across the gap.
+    return { ...a, held: true }
+  }
+  const alpha = Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t)))
+  const lerp = (av: number, bv: number) => av + (bv - av) * alpha
+  const nearest = alpha < 0.5 ? a : b
+  return { t, x: lerp(a.x, b.x), y: lerp(a.y, b.y), w: lerp(a.w, b.w), h: lerp(a.h, b.h), label: nearest.label, conf: nearest.conf }
+}
+
+// Styles a normalized bbox for a container that displays the frame with
+// object-fit: contain. When the frame's aspect ratio differs from the
+// container's, the image is letterboxed, so the box must be mapped into the
+// image's content rect, not placed with raw percentages of the container.
+function detectionBoxStyle(d: { bbox_x: number; bbox_y: number; bbox_width: number; bbox_height: number }, frameW: number, frameH: number, containerAspect: number): CSSProperties {
+  const fa = frameW > 0 && frameH > 0 ? frameW / frameH : containerAspect
+  const cw = Math.min(1, fa / containerAspect)
+  const ch = Math.min(1, containerAspect / fa)
+  const pct = (v: number) => `${(v * 100).toFixed(3)}%`
+  return {
+    left: pct((1 - cw) / 2 + d.bbox_x * cw),
+    top: pct((1 - ch) / 2 + d.bbox_y * ch),
+    width: pct(d.bbox_width * cw),
+    height: pct(d.bbox_height * ch),
+  }
+}
+
 export default function VideoDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -79,6 +150,8 @@ export default function VideoDetail() {
   const [tracks, setTracks] = useState<Track[]>([])
   const [detToTrack, setDetToTrack] = useState<Record<string, number>>({})
   const [selectedTrack, setSelectedTrack] = useState<number | 'all'>('all')
+  const overlayRef = useRef<HTMLCanvasElement>(null)
+  const [overlayOn, setOverlayOn] = useState(true)
   const [events, setEvents] = useState<Event[]>([])
   const [eventFilter, setEventFilter] = useState<string>('all')
   const [descriptions, setDescriptions] = useState<SegmentDescription[]>([])
@@ -206,6 +279,99 @@ export default function VideoDetail() {
     return () => clearInterval(t)
   }, [video?.status])
 
+  // -- Bounding-box playback overlay -----------------------------------------
+  // frame_id -> video-timeline timestamp, needed to place detections on playback.
+  // Frame timestamps are recorded on the source file's PTS timeline; the browser
+  // playback timeline starts at 0, so container start_time offsets must be
+  // removed for the boxes to line up with what is on screen.
+  const frameTimesById = useMemo(() => {
+    const m: Record<string, number> = {}
+    const st = media?.start_time
+    const offset = st != null && isFinite(st) && st > 0 ? st : 0
+    frames.forEach(f => { m[f.id] = f.timestamp_seconds - offset })
+    return m
+  }, [frames, media?.start_time])
+
+  // Group detections per track into sorted (timestamp, bbox) keypoints.
+  // Detections without a track become singleton keys: their box is shown for a
+  // short window around the timestamp (dashed "held") instead of interpolated.
+  const overlayTracks = useMemo<OverlayTrack[]>(() => {
+    const byKey = new Map<string, OverlayPoint[]>()
+    detections.forEach(d => {
+      const t = frameTimesById[d.frame_id]
+      if (t == null || !isFinite(t)) return
+      const ti = detToTrack[d.id]
+      const key = ti !== undefined ? `t${ti}` : `d${d.id}`
+      let arr = byKey.get(key)
+      if (!arr) { arr = []; byKey.set(key, arr) }
+      arr.push({ t, x: d.bbox_x, y: d.bbox_y, w: d.bbox_width, h: d.bbox_height, label: d.label, conf: d.confidence })
+    })
+    const out: OverlayTrack[] = []
+    byKey.forEach((pts, key) => {
+      pts.sort((p, q) => p.t - q.t)
+      const trackIndex = key.startsWith('t') ? Number(key.slice(1)) : null
+      out.push({ trackIndex, color: trackColor(pts[pts.length - 1].label), pts })
+    })
+    return out
+  }, [detections, frameTimesById, detToTrack])
+
+  // Redraw every animation frame while the overlay is enabled: boxes are
+  // interpolated at the current playback time, not only at sampled timestamps.
+  useEffect(() => {
+    const canvas = overlayRef.current
+    if (!overlayOn || !canvas) return
+    let raf = 0
+    const draw = () => {
+      const el = videoRef.current
+      const cw = canvas.clientWidth, ch = canvas.clientHeight
+      const dpr = window.devicePixelRatio || 1
+      const pw = Math.max(1, Math.round(cw * dpr)), ph = Math.max(1, Math.round(ch * dpr))
+      if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph }
+      const ctx = canvas.getContext('2d')
+      if (el && ctx && cw > 0 && ch > 0) {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        ctx.clearRect(0, 0, cw, ch)
+        const vw = el.videoWidth, vh = el.videoHeight
+        if (vw > 0 && vh > 0) {
+          // object-fit: contain — the video may be letterboxed inside the
+          // player; compute the content rect so normalized bboxes land on the
+          // right pixels for any video aspect ratio.
+          const scale = Math.min(cw / vw, ch / vh)
+          const dw = vw * scale, dh = vh * scale
+          const ox = (cw - dw) / 2, oy = (ch - dh) / 2
+          const now = el.currentTime
+          overlayTracks.forEach(tr => {
+            const box = interpolateBox(tr.pts, now)
+            if (!box) return
+            const isDim = selectedTrack !== 'all' && tr.trackIndex !== selectedTrack
+            const x = ox + box.x * dw, y = oy + box.y * dh, bw = box.w * dw, bh = box.h * dh
+            if (bw < 2 || bh < 2) return
+            ctx.globalAlpha = isDim ? 0.25 : box.held ? 0.85 : 1
+            ctx.lineWidth = 2
+            // Interpolated boxes are solid; held boxes (between far-apart
+            // observations) are dashed to mark them as approximate positions.
+            ctx.setLineDash(box.held ? [5, 4] : [])
+            ctx.strokeStyle = tr.color
+            ctx.strokeRect(x, y, bw, bh)
+            ctx.setLineDash([])
+            const text = `${box.label} ${(box.conf * 100).toFixed(0)}%${tr.trackIndex !== null ? ` T${tr.trackIndex}` : ''}`
+            ctx.font = '700 11px ui-sans-serif, system-ui, -apple-system, sans-serif'
+            const tw = ctx.measureText(text).width
+            const ly = Math.max(0, y - 16)
+            ctx.fillStyle = tr.color
+            ctx.fillRect(x, ly, tw + 8, 15)
+            ctx.fillStyle = tr.color === '#f59e0b' ? '#1f2937' : '#ffffff'
+            ctx.fillText(text, x + 4, ly + 11)
+            ctx.globalAlpha = 1
+          })
+        }
+      }
+      raf = requestAnimationFrame(draw)
+    }
+    raf = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(raf)
+  }, [overlayOn, overlayTracks, selectedTrack])
+
   const onDelete = async () => {
     if (!video) return
     const ok = await confirm({
@@ -302,7 +468,11 @@ export default function VideoDetail() {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="player-wrap">
             <div className="player-media">
-              <video ref={videoRef} controls preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }} src={client.imageUrl(`/api/v1/videos/${video.id}/stream`)} poster={frames[0] ? imgSrc(frames[0]) : undefined} />
+              <video ref={videoRef} controls preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }} src={client.imageUrl(`/api/v1/videos/${video.id}/stream`)} poster={frames[0] ? imgSrc(frames[0]) : undefined} />
+              <canvas ref={overlayRef} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none', display: overlayOn ? 'block' : 'none' }} />
+              <button onClick={() => setOverlayOn(v => !v)} title="Interpolated bounding-box overlay for tracked objects" style={{ position: 'absolute', top: 8, right: 8, zIndex: 3, padding: '5px 10px', fontSize: 11, fontWeight: 600, borderRadius: 8, border: '1px solid rgba(255,255,255,0.25)', background: overlayOn ? 'rgba(16,163,127,0.92)' : 'rgba(15,17,20,0.65)', color: '#fff', cursor: 'pointer', backdropFilter: 'blur(4px)' }}>
+                {overlayOn ? '◉ Track boxes' : '○ Track boxes'}
+              </button>
             </div>
           </div>
         </div>
@@ -363,30 +533,17 @@ export default function VideoDetail() {
             {segments.map(s => (
               <div key={s.id} style={{ position: 'absolute', left: `${(s.start_time / effectiveTotal) * 100}%`, width: `${Math.max(0.5, (s.duration / effectiveTotal) * 100)}%`, top: 4, bottom: 4, background: '#d4ede5', borderRight: '1px solid #b8ddd0', borderRadius: 2 }} title={`S${s.segment_index} ${formatDur(s.start_time)}-${formatDur(s.end_time)}`} />
             ))}
-            {(() => {
-              const labelColor = (label: string) => {
-                const l = (label || '').toLowerCase()
-                if (l === 'person') return '#0e9f6e'
-                if (l === 'vehicle' || l === 'car' || l === 'truck' || l === 'bus' || l === 'motorcycle' || l === 'bicycle') return '#3b82f6'
-                if (l) return '#f59e0b'
-                return '#ef4444'
-              }
-              return (
-                <>
-                  {tracks.map(tr => {
-                    const left = (tr.start_timestamp / effectiveTotal) * 100
-                    const w = ((tr.end_timestamp - tr.start_timestamp) / effectiveTotal) * 100
-                    if (left > 100 || left < 0) return null
-                    return <div key={`tr-${tr.id}`} style={{ position: 'absolute', left: `${left}%`, width: `${Math.max(0.8, Math.min(w, 100 - left))}%`, top: 10, height: 4, background: labelColor(tr.label), opacity: 0.55, borderRadius: 1 }} title={`${tr.label} #${tr.track_index} ${formatDur(tr.start_timestamp)}-${formatDur(tr.end_timestamp)}`} />
-                  })}
-                  {events.map(ev => {
-                    const left = (ev.start_timestamp / effectiveTotal) * 100
-                    if (left > 100 || left < 0) return null
-                    return <div key={`ev-${ev.id}`} className="marker" style={{ left: `${left}%`, background: '#ef4444', height: 14, width: 2.5, opacity: 0.95, borderRadius: 1, top: 7 }} title={`${ev.event_type} ${ev.label} @${formatDur(ev.start_timestamp)}`} />
-                  })}
-                </>
-              )
-            })()}
+            {tracks.map(tr => {
+              const left = (tr.start_timestamp / effectiveTotal) * 100
+              const w = ((tr.end_timestamp - tr.start_timestamp) / effectiveTotal) * 100
+              if (left > 100 || left < 0) return null
+              return <div key={`tr-${tr.id}`} style={{ position: 'absolute', left: `${left}%`, width: `${Math.max(0.8, Math.min(w, 100 - left))}%`, top: 10, height: 4, background: trackColor(tr.label), opacity: 0.55, borderRadius: 1 }} title={`${tr.label} #${tr.track_index} ${formatDur(tr.start_timestamp)}-${formatDur(tr.end_timestamp)}`} />
+            })}
+            {events.map(ev => {
+              const left = (ev.start_timestamp / effectiveTotal) * 100
+              if (left > 100 || left < 0) return null
+              return <div key={`ev-${ev.id}`} className="marker" style={{ left: `${left}%`, background: '#ef4444', height: 14, width: 2.5, opacity: 0.95, borderRadius: 1, top: 7 }} title={`${ev.event_type} ${ev.label} @${formatDur(ev.start_timestamp)}`} />
+            })}
           </div>
         </div>
         <div className="timeline-labels">{tickLabels.map(l => <span key={l}>{l}</span>)}</div>
@@ -640,7 +797,9 @@ export default function VideoDetail() {
                     const highlighted = selectedTrack !== 'all' && trackIdx === selectedTrack
                     const dimmed = selectedTrack !== 'all' && trackIdx !== selectedTrack
                     return (
-                      <div key={d.id} className="bbox" style={{ left: `${d.bbox_x * 100}%`, top: `${d.bbox_y * 100}%`, width: `${d.bbox_width * 100}%`, height: `${d.bbox_height * 100}%`, borderColor: highlighted ? '#10a37f' : undefined, background: highlighted ? 'rgba(16,163,127,0.18)' : dimmed ? 'rgba(250,204,21,0.06)' : undefined, opacity: dimmed ? 0.4 : 1 }}>
+                      // 16/9 = the .frame-card .img-wrap aspect ratio; the helper
+                      // maps the bbox into the image's letterboxed content rect.
+                      <div key={d.id} className="bbox" style={{ ...detectionBoxStyle(d, f.width, f.height, 16 / 9), borderColor: highlighted ? '#10a37f' : undefined, background: highlighted ? 'rgba(16,163,127,0.18)' : dimmed ? 'rgba(250,204,21,0.06)' : undefined, opacity: dimmed ? 0.4 : 1 }}>
                         <span className="bbox-label" style={highlighted ? { background: '#10a37f' } : undefined}>{d.label} {(d.confidence * 100).toFixed(0)}%{trackIdx !== undefined ? ` T${trackIdx}` : ''}</span>
                       </div>
                     )
@@ -672,7 +831,9 @@ export default function VideoDetail() {
                 const highlighted = selectedTrack !== 'all' && trackIdx === selectedTrack
                 const dimmed = selectedTrack !== 'all' && trackIdx !== selectedTrack
                 return (
-                  <div key={d.id} className="bbox" style={{ left: `${d.bbox_x * 100}%`, top: `${d.bbox_y * 100}%`, width: `${d.bbox_width * 100}%`, height: `${d.bbox_height * 100}%`, borderColor: highlighted ? '#10a37f' : undefined, background: highlighted ? 'rgba(16,163,127,0.18)' : dimmed ? 'rgba(250,204,21,0.06)' : undefined, opacity: dimmed ? 0.4 : 1 }}>
+                  // Modal image has no forced aspect ratio, so the content rect
+                  // equals the image itself: the helper reduces to raw ~percentages.
+                  <div key={d.id} className="bbox" style={{ ...detectionBoxStyle(d, selectedFrame.width, selectedFrame.height, selectedFrame.width > 0 && selectedFrame.height > 0 ? selectedFrame.width / selectedFrame.height : 16 / 9), borderColor: highlighted ? '#10a37f' : undefined, background: highlighted ? 'rgba(16,163,127,0.18)' : dimmed ? 'rgba(250,204,21,0.06)' : undefined, opacity: dimmed ? 0.4 : 1 }}>
                     <span className="bbox-label" style={highlighted ? { background: '#10a37f' } : undefined}>{d.label} {(d.confidence * 100).toFixed(0)}%{trackIdx !== undefined ? ` T${trackIdx}` : ''}</span>
                   </div>
                 )
