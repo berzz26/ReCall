@@ -4,9 +4,63 @@ import (
 	"context"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 )
+
+// Class-confusion groups: YOLO flips categories between frames for the same
+// physical object (car↔truck, dog↔cat). Identity must not be broken by a
+// label flip, so association matches on the canonical group instead of the
+// raw label. The track's stored label is the one it was born with.
+func confusionGroup(label string) string {
+	l := strings.ToLower(strings.TrimSpace(label))
+	switch l {
+	case "car", "truck", "bus", "van", "vehicle", "suv", "minivan", "license_plate":
+		return "vehicle"
+	case "bicycle", "motorcycle", "bike", "scooter", "electric_scooter":
+		return "two_wheeler"
+	case "chair", "couch", "bench", "sofa", "potted_plant":
+		return "furniture"
+	case "dog", "cat", "bear", "bird", "horse", "sheep", "cow", "animal":
+		return "animal"
+	case "suitcase", "backpack", "handbag":
+		return "luggage"
+	default:
+		return l
+	}
+}
+
+func sameClass(a, b string) bool {
+	return confusionGroup(a) == confusionGroup(b)
+}
+
+// Sparse-video association. Sampled YOLO frames can be seconds apart (see
+// FRAME_SAMPLE_INTERVAL and the adaptive sampler), so hard Mahalanobis/IoU
+// gates tuned for ~30 FPS video forbid otherwise obvious re-associations and
+// fragment tracks. When the time between frames exceeds Sparse.DtThreshold the
+// association switches to a dt-aware spatial gate instead:
+//
+//	center-distance( predicted-state | last-observed, detection ) <= allowedDrift(dt)
+//
+// allowedDrift lifts gently with dt (a floor keeps slow/stationary objects
+// associated, a speed limit covers walking/crossing motion). IoU overlap is
+// still honored and ranks closer matches cheaper.
+const (
+	sparseDtThreshold = 2.5  // seconds between frames before sparse gating kicks in
+	sparseAllowFloor  = 0.04 // normalized center-distance floor (slow/stationary objects)
+	sparseMaxSpeed    = 0.28 // normalized frame units per second (walk/vehicle speed headroom)
+	// Cross-gap re-association: a track that was removed while unobserved gets
+	// re-attached to a later track of the same class if the gap since its last
+	// observation is within this limit and the first box fits its trajectory.
+	reattachMaxGap = 30.0
+)
+
+// allowedDrift is the maximum normalized center distance that still counts as
+// "same object" after dt seconds without observation.
+func (t *ByteTrack) allowedDrift(dt float64) float64 {
+	return t.Sparse.AllowFloor + t.Sparse.MaxSpeed*dt
+}
 
 // ByteTrack implements the ByteTrack two-stage association in pure Go.
 // High/low split, Kalman prediction, Hungarian assignment, label-aware matching,
@@ -18,9 +72,10 @@ type ByteTrack struct {
 	TrackBuffer    int
 	FuseScore      bool
 	MinHits        int
+	Sparse         SparseParams
 }
 
-func NewByteTrack(high, low, match float64, buffer int, fuseScore bool, minHits int) *ByteTrack {
+func NewByteTrack(high, low, match float64, buffer int, fuseScore bool, minHits int, sparse SparseParams) *ByteTrack {
 	if minHits < 1 {
 		minHits = 2
 	}
@@ -31,11 +86,12 @@ func NewByteTrack(high, low, match float64, buffer int, fuseScore bool, minHits 
 		TrackBuffer:    buffer,
 		FuseScore:      fuseScore,
 		MinHits:        minHits,
+		Sparse:         sparse.withDefaults(),
 	}
 }
 
 func (t *ByteTrack) Name() string    { return "bytetrack" }
-func (t *ByteTrack) Version() string { return "2" }
+func (t *ByteTrack) Version() string { return "3" }
 
 // TrackState represents ByteTrack track lifecycle.
 type TrackState int
@@ -48,20 +104,20 @@ const (
 )
 
 type btTrack struct {
-	Index              int
-	Label              string
-	State              TrackState
-	Mean               [8]float64
-	Cov                [8][8]float64
-	LastBBox           DetectionInput // last observed bbox (for fallback if Kalman not yet)
-	PredictedBBox      DetectionInput // predicted bbox for association (derived from Mean)
-	Age                int
-	Hits               int
-	Misses             int
-	StartTimestamp     float64
-	LastTimestamp      float64
-	LastMatchedTime    float64
-	HitCount           int // number of successful observations
+	Index           int
+	Label           string
+	State           TrackState
+	Mean            [8]float64
+	Cov             [8][8]float64
+	LastBBox        DetectionInput // last observed bbox (for fallback if Kalman not yet)
+	PredictedBBox   DetectionInput // predicted bbox for association (derived from Mean)
+	Age             int
+	Hits            int
+	Misses          int
+	StartTimestamp  float64
+	LastTimestamp   float64
+	LastMatchedTime float64
+	HitCount        int // number of successful observations
 }
 
 // Kalman helpers
@@ -496,7 +552,7 @@ func (t *ByteTrack) Track(ctx context.Context, frames []FrameInput, detectionsBy
 		matchedHigh := make(map[int]bool)
 
 		if len(trackedLost) > 0 && len(highDets) > 0 {
-			cost := buildCostMatrixByteTrack(trackedLost, highDets, t.MatchThreshold, t.FuseScore)
+			cost := buildCostMatrixByteTrack(trackedLost, highDets, t.MatchThreshold, t.FuseScore, dt, t.Sparse)
 			assign := hungarianRect(cost, len(trackedLost), len(highDets))
 			for i, tr := range trackedLost {
 				j := assign[i]
@@ -539,7 +595,7 @@ func (t *ByteTrack) Track(ctx context.Context, frames []FrameInput, detectionsBy
 		// Second stage: remaining Tracked vs low
 		matchedLow := make(map[int]bool)
 		if len(remainingTracked) > 0 && len(lowDets) > 0 {
-			cost := buildCostMatrixByteTrack(remainingTracked, lowDets, t.MatchThreshold, t.FuseScore)
+			cost := buildCostMatrixByteTrack(remainingTracked, lowDets, t.MatchThreshold, t.FuseScore, dt, t.Sparse)
 			assign := hungarianRect(cost, len(remainingTracked), len(lowDets))
 			for i, tr := range remainingTracked {
 				j := assign[i]
@@ -639,6 +695,108 @@ func (t *ByteTrack) Track(ctx context.Context, frames []FrameInput, detectionsBy
 		prevTimestamp = &timestampCopy
 	}
 
+	// Reverse lookup: detectionID -> (timestamp, detection box), and the first
+	// observation per track index, used by the cross-gap re-association pass.
+	type detInfo struct {
+		t   float64
+		det DetectionInput
+	}
+	detInfoByID := make(map[uuid.UUID]detInfo)
+	frameTsByFrameID := make(map[uuid.UUID]float64)
+	for _, f := range frames {
+		frameTsByFrameID[f.FrameID] = f.Timestamp
+	}
+	for frID, ds := range detectionsByFrame {
+		ts := frameTsByFrameID[frID]
+		for _, d := range ds {
+			detInfoByID[d.ID] = detInfo{t: ts, det: d}
+		}
+	}
+	firstObs := make(map[int]detInfo) // trackIndex -> earliest assigned observation
+	for detID, idx := range assignments {
+		di, ok := detInfoByID[detID]
+		if !ok {
+			continue
+		}
+		if fo, ok := firstObs[idx]; !ok || di.t < fo.t {
+			firstObs[idx] = di
+		}
+	}
+
+	// -- Cross-gap re-association ---------------------------------------------
+	// With sparse sampling an object is routinely unobserved long enough for
+	// its track to die (state Removed), so the next observation spawns a new
+	// track index — tracks fragment every gap. Here each removed track's
+	// trajectory endpoint is matched against later tracks' first observation:
+	// if the gap is within reattachMaxGap, classes match, and the first box is
+	// within the dt-aware drift limit, the later track's detections are
+	// re-pointed to the older index, restoring one identity across the gap.
+	type deadSeed struct {
+		idx      int
+		label    string
+		lastT    float64
+		lastBBox DetectionInput
+	}
+	var deads []deadSeed
+	for _, tr := range active {
+		// Only truly dead tracks participate; a Lost-but-alive track is still
+		// matching in the main loop and Removed tracks keep their state here.
+		if tr.State == StateRemoved && tr.HitCount >= t.MinHits {
+			deads = append(deads, deadSeed{idx: tr.Index, label: tr.Label, lastT: tr.LastTimestamp, lastBBox: tr.LastBBox})
+		}
+	}
+	if len(deads) > 0 {
+		type cand struct {
+			deadIdx, lateIdx int
+			ratio            float64
+		}
+		var cands []cand
+		for _, dc := range deads {
+			for lateIdx, fo := range firstObs {
+				if lateIdx == dc.idx {
+					continue
+				}
+				gap := fo.t - dc.lastT
+				if gap <= 0.05 || gap > t.Sparse.ReattachGap {
+					continue
+				}
+				if !sameClass(dc.label, fo.det.Label) {
+					continue
+				}
+				limit := t.allowedDrift(gap)
+				ratio := centerDistance(dc.lastBBox, fo.det) / limit
+				if ratio <= 1 {
+					cands = append(cands, cand{deadIdx: dc.idx, lateIdx: lateIdx, ratio: ratio})
+				}
+			}
+		}
+		if len(cands) > 0 {
+			sort.Slice(cands, func(i, j int) bool {
+				if cands[i].ratio == cands[j].ratio {
+					return cands[i].deadIdx < cands[j].deadIdx
+				}
+				return cands[i].ratio < cands[j].ratio
+			})
+			detIDsByIndex := make(map[int][]uuid.UUID)
+			for detID, idx := range assignments {
+				detIDsByIndex[idx] = append(detIDsByIndex[idx], detID)
+			}
+			usedDead := make(map[int]bool)
+			usedLate := make(map[int]bool)
+			for _, c := range cands {
+				if usedDead[c.deadIdx] || usedLate[c.lateIdx] {
+					continue
+				}
+				usedDead[c.deadIdx] = true
+				usedLate[c.lateIdx] = true
+				for _, detID := range detIDsByIndex[c.lateIdx] {
+					assignments[detID] = c.deadIdx
+				}
+				delete(firstObs, c.lateIdx)
+			}
+		}
+	}
+
 	// Filter assignments to only confirmed tracks (HitCount >= MinHits)
 	// Keep all tracks' HitCount, including Removed (still in active map)
 	filtered := make(map[uuid.UUID]int)
@@ -707,7 +865,7 @@ const INF = 1e9
 
 const chiSquareThreshold = 9.4877
 
-func buildCostMatrixByteTrack(tracks []*btTrack, dets []DetectionInput, matchThreshold float64, fuseScore bool) [][]float64 {
+func buildCostMatrixByteTrack(tracks []*btTrack, dets []DetectionInput, matchThreshold float64, fuseScore bool, dt float64, sparse SparseParams) [][]float64 {
 	nRows := len(tracks)
 	nCols := len(dets)
 	cost := make([][]float64, nRows)
@@ -717,6 +875,10 @@ func buildCostMatrixByteTrack(tracks []*btTrack, dets []DetectionInput, matchThr
 			cost[i][j] = INF
 		}
 	}
+	allowedDrift := func(dt float64) float64 {
+		return sparse.AllowFloor + sparse.MaxSpeed*dt
+	}
+	sparseGating := dt > sparse.DtThreshold
 	for i, tr := range tracks {
 		// Use predicted bbox for tracks
 		predBBox := tr.PredictedBBox
@@ -726,11 +888,37 @@ func buildCostMatrixByteTrack(tracks []*btTrack, dets []DetectionInput, matchThr
 			predBBox = xyahToTLWH(tr.Mean, tr.Label)
 		}
 		for j, d := range dets {
-			if tr.Label != d.Label {
+			// Soft label gate: match on confusion group so a YOLO category
+			// flip between frames does not break the object's identity.
+			if !sameClass(tr.Label, d.Label) {
+				continue
+			}
+			z := tlwhToXyah(d)
+			if sparseGating {
+				// Sparse gating: the Mahalanobis/IoU prediction gates are
+				// meaningless across multi-second gaps, so gate on dt-aware
+				// spatial plausibility instead. Ranking still prefers
+				// overlapping and closer boxes.
+				dPred := centerDistance(predBBox, d)
+				dLast := centerDistance(tr.LastBBox, d)
+				limit := allowedDrift(dt)
+				overlap := iouByteTrack(predBBox, d) > 0 || iouByteTrack(tr.LastBBox, d) > 0
+				ratio := math.Min(dPred, dLast) / limit
+				if ratio > 1 && !overlap {
+					continue
+				}
+				if ratio > 1 {
+					ratio = 1
+				}
+				iou := iouByteTrack(predBBox, d)
+				if iou > 0 {
+					cost[i][j] = (1-iou)*0.6 + 0.4*ratio
+				} else {
+					cost[i][j] = 0.5 + 0.5*ratio
+				}
 				continue
 			}
 			// Mahalanobis gating on predicted Kalman state (4-dim chi-square 95%)
-			z := tlwhToXyah(d)
 			if gatingDistance(tr.Mean, tr.Cov, z) > chiSquareThreshold {
 				continue
 			}

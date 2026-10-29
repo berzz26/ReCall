@@ -130,6 +130,22 @@ midpoint. Gap priority = `max(tracker_disagreement, gamma × probe_rank) × gap`
 | `TRACKER_FUSE_SCORE` | `true` | Multiply overlap by detection confidence when matching, so strong detections win ambiguous links. |
 | `TRACKER_MIN_HITS` | `2` | Detections a candidate needs before it is reported as a track. Higher kills false positives but drops genuinely brief appearances. |
 
+### 5.1 Sparse-video association (ByteTrack)
+
+Sampled YOLO frames can be seconds apart (`FRAME_SAMPLE_INTERVAL`, adaptive
+sampler), so once the time between two frames exceeds
+`TRACKER_SPARSE_DT_THRESHOLD` the tracker switches from the strict
+Kalman/IoU gating (calibrated for ~30 FPS video) to a dt-aware spatial
+gate: a detection joins a track if it is within the drift allowance of the
+track's predicted or last-observed box.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TRACKER_SPARSE_DT_THRESHOLD` | `2.5` | Seconds between frames before sparse gating takes over from the dense gates. Lower = sparse gating used more often (more permissive); `0` has no meaning here, use a large value to effectively disable sparse gating only below it. |
+| `TRACKER_SPARSE_ALLOW_FLOOR` | `0.04` | Normalized center-distance floor of the drift gate — how far a slow/stationary object may sit from its last observed position and still re-associate. |
+| `TRACKER_SPARSE_MAX_SPEED` | `0.28` | Normalized frame units per second of allowed motion. `allowance = floor + speed × Δt`. Higher tolerates faster crossing motion but risks gluing distinct objects across gaps. |
+| `TRACKER_REATTACH_MAX_GAP` | `30` | Seconds a track that died while unobserved can still be re-attached to its later reappearance (same confusion class, first box within the drift allowance). Re-attachment restores one identity instead of spawning a new track ID. Associated class-confusion groups (car/truck → vehicle, person, etc.) are hard-coded — label flips between frames do not break identity. |
+
 ## 6. Video description (VLM)
 
 | Variable | Default | What it does |

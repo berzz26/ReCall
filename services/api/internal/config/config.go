@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/berzz26/recall/services/api/internal/tracker"
 	"github.com/joho/godotenv"
 )
 
@@ -94,6 +95,11 @@ type Config struct {
 	TrackerTrackBuffer     int
 	TrackerFuseScore       bool
 	TrackerMinHits         int
+	// Sparse-gating tuning (see tracker.SparseParams).
+	TrackerSparseDtThreshold float64
+	TrackerSparseAllowFloor  float64
+	TrackerSparseMaxSpeed    float64
+	TrackerReattachMaxGap    float64
 }
 
 func Load() Config {
@@ -817,85 +823,129 @@ func Load() Config {
 		panic(fmt.Sprintf("invalid TRACKER_MIN_HITS %d: must be >= 1", trackerMinHits))
 	}
 
+	// Sparse-gating tuning defaults (see tracker.SparseParams and the consts
+	// in bytetrack.go). All are optional; zero/absent falls back to defaults.
+	cfgTrackerSparseDtThreshold := 2.5
+	if v := os.Getenv("TRACKER_SPARSE_DT_THRESHOLD"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid TRACKER_SPARSE_DT_THRESHOLD %q: %v", v, err))
+		}
+		cfgTrackerSparseDtThreshold = parsed
+	}
+	cfgTrackerSparseAllowFloor := 0.04
+	if v := os.Getenv("TRACKER_SPARSE_ALLOW_FLOOR"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid TRACKER_SPARSE_ALLOW_FLOOR %q: %v", v, err))
+		}
+		cfgTrackerSparseAllowFloor = parsed
+	}
+	cfgTrackerSparseMaxSpeed := 0.28
+	if v := os.Getenv("TRACKER_SPARSE_MAX_SPEED"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid TRACKER_SPARSE_MAX_SPEED %q: %v", v, err))
+		}
+		cfgTrackerSparseMaxSpeed = parsed
+	}
+	trackerSparse := tracker.SparseParams{
+		DtThreshold: cfgTrackerSparseDtThreshold,
+		AllowFloor:  cfgTrackerSparseAllowFloor,
+		MaxSpeed:    cfgTrackerSparseMaxSpeed,
+		ReattachGap: 30.0,
+	}
+	if v := os.Getenv("TRACKER_REATTACH_MAX_GAP"); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid TRACKER_REATTACH_MAX_GAP %q: %v", v, err))
+		}
+		trackerSparse.ReattachGap = parsed
+	}
+
 	return Config{
-		Env:                    env,
-		Port:                   port,
-		Addr:                   ":" + port,
-		DatabaseURL:            dbURL,
-		StorageRoot:            storageRoot,
-		MaxUploadSize:          maxUploadSize,
-		StabilitySeconds:       stabilitySeconds,
-		StabilityDuration:      time.Duration(stabilitySeconds) * time.Second,
-		PollInterval:           pollInterval,
-		FFprobePath:            ffprobePath,
-		FFprobeTimeout:         ffprobeTimeout,
-		SegmentDuration:        segmentDuration,
-		FrameSampleInterval:    frameSampleInterval,
-		SamplerBeta:            samplerBeta,
-		SamplerAdaptive:        samplerAdaptive,
-		ProbeFPS:               probeFPS,
-		ProbeSize:              probeSize,
-		ProbeGrid:              probeGrid,
-		ProbeNoiseK:            probeNoiseK,
-		CoarseInterval:         coarseInterval,
-		CoarseMaxGap:           coarseMaxGap,
-		CoarseFKeep:            coarseFKeep,
-		SamplerPlanTimeout:     samplerPlanTimeout,
-		SamplerGamma:           samplerGamma,
-		SamplerMinGap:          samplerMinGap,
-		SamplerEpsilon:         samplerEpsilon,
-		SamplerMaxRounds:       samplerMaxRounds,
-		SamplerShadow:          samplerShadow,
-		SamplerBusyThreshold:   samplerBusyThreshold,
-		SamplerBusyFraction:    samplerBusyFraction,
-		FFmpegPath:             ffmpegPath,
-		FFmpegTimeout:          ffmpegTimeout,
-		PlayableTimeout:        playableTimeout,
-		FrameJPEGQuality:       frameJPEGQuality,
-		DetectionThreshold:     detectionThreshold,
-		DetectorName:           detectorName,
-		DetectorVersion:        detectorVersion,
-		ModelPath:              modelPath,
-		PythonPath:             pythonPath,
-		YOLOBatchSize:          yoloBatchSize,
-		ExtractWorkers:         extractWorkers,
-		EventMovementThreshold: movementThreshold,
-		VisionProvider:         visionProvider,
-		VisionPythonPath:       visionPythonPath,
-		VisionModel:            visionModel,
-		VisionModelPath:        visionModelPath,
-		VisionModelVersion:     visionVersion,
-		VisionMaxFrames:        visionMaxFrames,
-		VisionMaxOutputTokens:  visionMaxOutputTokens,
-		VisionTimeout:          visionTimeout,
-		VisionHistorySegments:  visionHistorySegments,
-		VisionHistoryEvents:    visionHistoryEvents,
-		GeminiAPIKey:           geminiAPIKey,
-		EmbeddingPythonPath:    embeddingPythonPath,
-		EmbeddingModel:         embeddingModel,
-		EmbeddingModelVersion:  embeddingModelVersion,
-		EmbeddingTimeout:       embeddingTimeout,
-		SearchCandidateLimit:   searchCandidateLimit,
-		SearchDefaultLimit:     searchDefaultLimit,
-		SearchMaxLimit:         searchMaxLimit,
-		SearchMinSimilarity:    searchMinSimilarity,
-		RerankerEnabled:        rerankerEnabled,
-		RerankerModel:          rerankerModel,
-		RerankerModelVersion:   rerankerModelVersion,
-		RerankerBackend:        rerankerBackend,
-		RerankerQuantization:   rerankerQuantization,
-		RerankerONNXDir:        rerankerONNXDir,
-		RerankerONNXThreads:    rerankerONNXThreads,
-		RerankerBatchSize:      rerankerBatchSize,
-		RerankerPythonPath:     rerankerPythonPath,
-		RerankerTimeout:        rerankerTimeout,
-		EnableVideoDescription: enableVideoDescription,
-		TrackerType:            trackerType,
-		TrackerHighThreshold:   trackerHighThreshold,
-		TrackerLowThreshold:    trackerLowThreshold,
-		TrackerMatchThreshold:  trackerMatchThreshold,
-		TrackerTrackBuffer:     trackerTrackBuffer,
-		TrackerFuseScore:       trackerFuseScore,
-		TrackerMinHits:         trackerMinHits,
+		Env:                      env,
+		Port:                     port,
+		Addr:                     ":" + port,
+		DatabaseURL:              dbURL,
+		StorageRoot:              storageRoot,
+		MaxUploadSize:            maxUploadSize,
+		StabilitySeconds:         stabilitySeconds,
+		StabilityDuration:        time.Duration(stabilitySeconds) * time.Second,
+		PollInterval:             pollInterval,
+		FFprobePath:              ffprobePath,
+		FFprobeTimeout:           ffprobeTimeout,
+		SegmentDuration:          segmentDuration,
+		FrameSampleInterval:      frameSampleInterval,
+		SamplerBeta:              samplerBeta,
+		SamplerAdaptive:          samplerAdaptive,
+		ProbeFPS:                 probeFPS,
+		ProbeSize:                probeSize,
+		ProbeGrid:                probeGrid,
+		ProbeNoiseK:              probeNoiseK,
+		CoarseInterval:           coarseInterval,
+		CoarseMaxGap:             coarseMaxGap,
+		CoarseFKeep:              coarseFKeep,
+		SamplerPlanTimeout:       samplerPlanTimeout,
+		SamplerGamma:             samplerGamma,
+		SamplerMinGap:            samplerMinGap,
+		SamplerEpsilon:           samplerEpsilon,
+		SamplerMaxRounds:         samplerMaxRounds,
+		SamplerShadow:            samplerShadow,
+		SamplerBusyThreshold:     samplerBusyThreshold,
+		SamplerBusyFraction:      samplerBusyFraction,
+		FFmpegPath:               ffmpegPath,
+		FFmpegTimeout:            ffmpegTimeout,
+		PlayableTimeout:          playableTimeout,
+		FrameJPEGQuality:         frameJPEGQuality,
+		DetectionThreshold:       detectionThreshold,
+		DetectorName:             detectorName,
+		DetectorVersion:          detectorVersion,
+		ModelPath:                modelPath,
+		PythonPath:               pythonPath,
+		YOLOBatchSize:            yoloBatchSize,
+		ExtractWorkers:           extractWorkers,
+		EventMovementThreshold:   movementThreshold,
+		VisionProvider:           visionProvider,
+		VisionPythonPath:         visionPythonPath,
+		VisionModel:              visionModel,
+		VisionModelPath:          visionModelPath,
+		VisionModelVersion:       visionVersion,
+		VisionMaxFrames:          visionMaxFrames,
+		VisionMaxOutputTokens:    visionMaxOutputTokens,
+		VisionTimeout:            visionTimeout,
+		VisionHistorySegments:    visionHistorySegments,
+		VisionHistoryEvents:      visionHistoryEvents,
+		GeminiAPIKey:             geminiAPIKey,
+		EmbeddingPythonPath:      embeddingPythonPath,
+		EmbeddingModel:           embeddingModel,
+		EmbeddingModelVersion:    embeddingModelVersion,
+		EmbeddingTimeout:         embeddingTimeout,
+		SearchCandidateLimit:     searchCandidateLimit,
+		SearchDefaultLimit:       searchDefaultLimit,
+		SearchMaxLimit:           searchMaxLimit,
+		SearchMinSimilarity:      searchMinSimilarity,
+		RerankerEnabled:          rerankerEnabled,
+		RerankerModel:            rerankerModel,
+		RerankerModelVersion:     rerankerModelVersion,
+		RerankerBackend:          rerankerBackend,
+		RerankerQuantization:     rerankerQuantization,
+		RerankerONNXDir:          rerankerONNXDir,
+		RerankerONNXThreads:      rerankerONNXThreads,
+		RerankerBatchSize:        rerankerBatchSize,
+		RerankerPythonPath:       rerankerPythonPath,
+		RerankerTimeout:          rerankerTimeout,
+		EnableVideoDescription:   enableVideoDescription,
+		TrackerType:              trackerType,
+		TrackerHighThreshold:     trackerHighThreshold,
+		TrackerLowThreshold:      trackerLowThreshold,
+		TrackerMatchThreshold:    trackerMatchThreshold,
+		TrackerTrackBuffer:       trackerTrackBuffer,
+		TrackerFuseScore:         trackerFuseScore,
+		TrackerMinHits:           trackerMinHits,
+		TrackerSparseDtThreshold: trackerSparse.DtThreshold,
+		TrackerSparseAllowFloor:  trackerSparse.AllowFloor,
+		TrackerSparseMaxSpeed:    trackerSparse.MaxSpeed,
+		TrackerReattachMaxGap:    trackerSparse.ReattachGap,
 	}
 }

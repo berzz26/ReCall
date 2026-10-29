@@ -99,7 +99,12 @@ func main() {
 	visualService := visual.NewServiceWithBatchSize(detectionRepo, videoFrameRepo, store, yolo, cfg.DetectionThreshold, cfg.DetectorName, cfg.DetectorVersion, cfg.YOLOBatchSize)
 
 	trackRepo := video_track.NewRepository(db.DB)
-	selectedTracker, err := tracker.New(cfg.TrackerType, cfg.TrackerHighThreshold, cfg.TrackerLowThreshold, cfg.TrackerMatchThreshold, cfg.TrackerTrackBuffer, cfg.TrackerFuseScore, cfg.TrackerMinHits)
+	selectedTracker, err := tracker.New(cfg.TrackerType, cfg.TrackerHighThreshold, cfg.TrackerLowThreshold, cfg.TrackerMatchThreshold, cfg.TrackerTrackBuffer, cfg.TrackerFuseScore, cfg.TrackerMinHits, tracker.SparseParams{
+		DtThreshold: cfg.TrackerSparseDtThreshold,
+		AllowFloor:  cfg.TrackerSparseAllowFloor,
+		MaxSpeed:    cfg.TrackerSparseMaxSpeed,
+		ReattachGap: cfg.TrackerReattachMaxGap,
+	})
 	if err != nil {
 		slog.Error("failed to create tracker", "error", err, "tracker_type", cfg.TrackerType)
 		os.Exit(1)
@@ -331,6 +336,7 @@ func main() {
 
 	detailHandler := handlers.NewVideoDetailHandlerWithDescriptions(videoMediaRepo, videoSegmentRepo, videoFrameRepo, detectionRepo, trackRepo, eventRepo, segmentDescRepo, store)
 	videoStreamHandler := handlers.NewVideoStreamHandler(videoRepo, store)
+	retrackHandler := handlers.NewRetrackHandler(trackService, eventService)
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
@@ -359,6 +365,7 @@ func main() {
 	v1.Mount("/local-sources", localSourceHandler.SetupRoutes())
 	v1.Post("/search/semantic", searchHandler.Search)
 	v1.Post("/search", unifiedSearchHandler.Search)
+	v1.Post("/videos/:id/retrack", retrackHandler.Retrack)
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

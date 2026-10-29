@@ -220,7 +220,11 @@ func ReplayThrowaway(ctx context.Context, frames []FrameInput, detectionsByFrame
 
 		// First stage: all live tracks vs high-confidence detections.
 		if len(candidates) > 0 && len(highDets) > 0 {
-			cost := buildCostMatrixByteTrack(candidates, highDets, cfg.MatchThreshold, cfg.FuseScore)
+			// dt 0 = dense-mode gating. The disagreement scorer relies on the
+			// strict (dense-video) association to surface fragmentation
+			// events for refinement; it must not inherit the production
+			// tracker's sparse gating, or its signal collapses to ~0.
+			cost := buildCostMatrixByteTrack(candidates, highDets, cfg.MatchThreshold, cfg.FuseScore, 0, SparseParams{})
 			assign := hungarianRect(cost, len(candidates), len(highDets))
 			for i, tr := range candidates {
 				j := assign[i]
@@ -246,7 +250,7 @@ func ReplayThrowaway(ctx context.Context, frames []FrameInput, detectionsByFrame
 		}
 		sort.Slice(remaining, func(i, j int) bool { return remaining[i].Index < remaining[j].Index })
 		if len(remaining) > 0 && len(lowDets) > 0 {
-			cost := buildCostMatrixByteTrack(remaining, lowDets, cfg.MatchThreshold, cfg.FuseScore)
+			cost := buildCostMatrixByteTrack(remaining, lowDets, cfg.MatchThreshold, cfg.FuseScore, 0, SparseParams{})
 			assign := hungarianRect(cost, len(remaining), len(lowDets))
 			for i, tr := range remaining {
 				j := assign[i]

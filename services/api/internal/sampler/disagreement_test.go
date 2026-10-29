@@ -252,7 +252,7 @@ func TestMultipleIntervals(t *testing.T) {
 // Test 10 — scoring never mutates production tracker state: production
 // assignments before and after scoring are identical.
 func TestNoProductionTrackerMutation(t *testing.T) {
-	prod, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2)
+	prod, err := tracker.New("bytetrack", 0.5, 0.1, 0.3, 5, true, 2, tracker.SparseParams{})
 	if err != nil {
 		t.Fatalf("tracker.New: %v", err)
 	}
