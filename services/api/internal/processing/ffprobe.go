@@ -441,50 +441,73 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 			w = 1280
 			h = 720
 		}
+		frameStart := time.Now()
+
+		// 1. Perception set first: production YOLO, ByteTrack, events, and
+		// the frame UI consume this regular fixed-rate cadence exclusively.
+		// The membership walk is idempotent — an unchanged grid reuses every
+		// stored frame without re-extraction and writes nothing — so a
+		// resumed run only extracts timestamps a previous attempt left
+		// missing, and perception membership is never accrued stale.
+		perceptionRes, err := p.frameService.GeneratePerceptionForVideo(ctx, v, segments, *meta.DurationSeconds, w, h)
+		if err != nil {
+			frameMs = time.Since(frameStart).Milliseconds()
+			slog.Error("pipeline: perception extraction failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
+			return fmt.Errorf("failed to extract perception frames: %w", err)
+		}
+		slog.Info("pipeline: perception extraction complete",
+			"video_id", v.ID.String(), "duration_ms", time.Since(frameStart).Milliseconds(),
+			"frames", len(perceptionRes.Frames))
+		if p.visualService != nil && len(perceptionRes.DroppedFrameIDs) > 0 {
+			// Frames demoted out of the perception set keep their rows
+			// (semantic-only now), so their persisted production detections
+			// were not cascaded away with a frame deletion. Purge them: the
+			// detection pass no longer refreshes those timestamps, and
+			// tracking and the VLM must never observe evidence from a frame
+			// that left the perception cadence.
+			if err := p.visualService.DeleteDetectionsByFrameIDs(ctx, perceptionRes.DroppedFrameIDs); err != nil {
+				return fmt.Errorf("failed to clean stale detections on demoted perception frames: %w", err)
+			}
+			slog.Info("pipeline: stale detections cleaned (frames left perception set)",
+				"video_id", v.ID.String(), "frames", len(perceptionRes.DroppedFrameIDs))
+		}
+
 		if p.adaptiveSampler != nil {
 			// Production adaptive boundary: probe → coarse/busy/refine →
 			// validated plan → extraction, with baseline fallbacks. The
-			// orchestrator owns resume-skip semantics for this path.
-			frameStart := time.Now()
+			// orchestrator owns resume-skip semantics for this path (its
+			// resume check queries the semantic set, not the perception set).
 			_, stats, err := p.adaptiveSampler.PlanAndExtract(ctx, v, segments, *meta.DurationSeconds, w, h, videoPath, p.checkpointRepo != nil)
-			frameMs = time.Since(frameStart).Milliseconds()
 			if err != nil {
+				frameMs = time.Since(frameStart).Milliseconds()
 				slog.Error("pipeline: adaptive sampling failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
 				return fmt.Errorf("failed adaptive sampling: %w", err)
 			}
 			slog.Info("pipeline: frame extraction complete (adaptive)",
-				"video_id", v.ID.String(), "duration_ms", frameMs,
+				"video_id", v.ID.String(), "duration_ms", time.Since(frameStart).Milliseconds(),
 				"sampler_mode", stats.Mode, "sampler_version", stats.Version,
 				"final_frames", stats.FinalFrames, "baseline_frames", stats.BaselineFrames,
 				"estimated_savings", stats.EstimatedSavings,
 				"fallback_reason", stats.FallbackReason)
 			// Downstream stages consume frames/detections from storage as
 			// usual; they never see the plan object or the sampler mode.
-		} else if p.checkpointRepo != nil {
-			// Checkpoint-aware frame extraction: skip if frames already exist for video (preserve completed segment frames)
-			if existingFrames, err := p.frameService.GetByVideoID(ctx, v.ID); err == nil && len(existingFrames) > 0 {
-				slog.Info("pipeline: frame extraction skipped (frames already exist, checkpoint)", "video_id", v.ID.String(), "existing_frames", len(existingFrames))
-				frameMs = 0
-			} else {
-				frameStart := time.Now()
-				if _, err := p.frameService.GenerateForVideo(ctx, v, segments, *meta.DurationSeconds, w, h); err != nil {
-					frameMs = time.Since(frameStart).Milliseconds()
-					slog.Error("pipeline: frame extraction failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
-					return fmt.Errorf("failed to extract frames: %w", err)
-				}
-				frameMs = time.Since(frameStart).Milliseconds()
-				slog.Info("pipeline: frame extraction complete", "video_id", v.ID.String(), "duration_ms", frameMs)
-			}
 		} else {
-			frameStart := time.Now()
+			// Legacy baseline path: the fixed-grid baseline plan replaces the
+			// semantic set's membership. The walk reuses every stored frame
+			// whose timestamp is on the grid (no re-extraction, no
+			// destruction of perception membership), which preserves the
+			// legacy skip-if-frames-exist outcome for completed runs while
+			// recovering cleanly from crashes mid-extraction.
 			if _, err := p.frameService.GenerateForVideo(ctx, v, segments, *meta.DurationSeconds, w, h); err != nil {
 				frameMs = time.Since(frameStart).Milliseconds()
 				slog.Error("pipeline: frame extraction failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
 				return fmt.Errorf("failed to extract frames: %w", err)
 			}
-			frameMs = time.Since(frameStart).Milliseconds()
-			slog.Info("pipeline: frame extraction complete", "video_id", v.ID.String(), "duration_ms", frameMs)
+			slog.Info("pipeline: frame extraction complete",
+				"video_id", v.ID.String(), "duration_ms", time.Since(frameStart).Milliseconds(),
+				"perception_frames", len(perceptionRes.Frames))
 		}
+		frameMs = time.Since(frameStart).Milliseconds()
 	}
 
 	if p.visualService != nil {

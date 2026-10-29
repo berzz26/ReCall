@@ -73,8 +73,8 @@ func main() {
 	videoSegmentService := video_segment.NewService(videoSegmentRepo, cfg.SegmentDuration)
 
 	videoFrameRepo := video_frame.NewRepository(db.DB)
-	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality).WithSamplerBeta(cfg.SamplerBeta).WithExtractWorkers(cfg.ExtractWorkers)
-	slog.Info("frame sampler configured", "sample_interval", cfg.FrameSampleInterval.String(), "sampler_beta", cfg.SamplerBeta)
+	videoFrameService := video_frame.NewService(videoFrameRepo, store, cfg.FrameSampleInterval, cfg.FFmpegPath, cfg.FFmpegTimeout, cfg.FrameJPEGQuality).WithSamplerBeta(cfg.SamplerBeta).WithExtractWorkers(cfg.ExtractWorkers).WithPerceptionSampleFPS(cfg.PerceptionSampleFPS)
+	slog.Info("frame sampler configured", "sample_interval", cfg.FrameSampleInterval.String(), "sampler_beta", cfg.SamplerBeta, "perception_fps", cfg.PerceptionSampleFPS)
 
 	detectionRepo := detection.NewRepository(db.DB)
 	scriptPath := filepath.Join("workers", "detector", "detect.py")

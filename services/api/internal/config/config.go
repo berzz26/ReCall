@@ -2,30 +2,37 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/berzz26/recall/services/api/internal/tracker"
 	"github.com/joho/godotenv"
+
+	"github.com/berzz26/recall/services/api/internal/tracker"
 )
 
 type Config struct {
-	Env                  string
-	Port                 string
-	Addr                 string
-	DatabaseURL          string
-	StorageRoot          string
-	MaxUploadSize        int64
-	StabilitySeconds     int
-	StabilityDuration    time.Duration
-	PollInterval         time.Duration
-	FFprobePath          string
-	FFprobeTimeout       time.Duration
-	SegmentDuration      time.Duration
-	FrameSampleInterval  time.Duration
+	Env                 string
+	Port                string
+	Addr                string
+	DatabaseURL         string
+	StorageRoot         string
+	MaxUploadSize       int64
+	StabilitySeconds    int
+	StabilityDuration   time.Duration
+	PollInterval        time.Duration
+	FFprobePath         string
+	FFprobeTimeout      time.Duration
+	SegmentDuration     time.Duration
+	FrameSampleInterval time.Duration
+	// PerceptionSampleFPS is the fixed perception-set sampling rate
+	// (PERCEPTION_SAMPLE_FPS). Production YOLO, ByteTrack, events, and the
+	// frame UI observe this cadence; the adaptive sampler's budgets never
+	// influence it.
+	PerceptionSampleFPS  float64
 	SamplerBeta          float64
 	SamplerAdaptive      bool
 	ProbeFPS             float64
@@ -181,6 +188,25 @@ func Load() Config {
 		} else {
 			panic(fmt.Sprintf("invalid FRAME_SAMPLE_INTERVAL %q: %v", v, err))
 		}
+	}
+
+	// Perception sampling rate: the regular fixed-rate cadence production
+	// YOLO / ByteTrack run on. Fully independent of the adaptive semantic
+	// sampler's budget settings; default 0.5 fps (2-second interval) matches
+	// the legacy baseline density.
+	perceptionSampleFPS := 0.5
+	if v := os.Getenv("PERCEPTION_SAMPLE_FPS"); v != "" {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			panic(fmt.Sprintf("invalid PERCEPTION_SAMPLE_FPS %q: %v", v, err))
+		}
+		if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			panic(fmt.Sprintf("PERCEPTION_SAMPLE_FPS must be a finite number, got %s", v))
+		}
+		if parsed <= 0 {
+			panic(fmt.Sprintf("PERCEPTION_SAMPLE_FPS must be > 0, got %s", v))
+		}
+		perceptionSampleFPS = parsed
 	}
 
 	ffmpegPath := os.Getenv("FFMPEG_PATH")
@@ -877,6 +903,7 @@ func Load() Config {
 		FFprobeTimeout:           ffprobeTimeout,
 		SegmentDuration:          segmentDuration,
 		FrameSampleInterval:      frameSampleInterval,
+		PerceptionSampleFPS:      perceptionSampleFPS,
 		SamplerBeta:              samplerBeta,
 		SamplerAdaptive:          samplerAdaptive,
 		ProbeFPS:                 probeFPS,

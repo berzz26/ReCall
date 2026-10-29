@@ -67,7 +67,9 @@ func NewServiceWithBatchSize(detRepo *detection.Repository, frameRepo *video_fra
 
 func (s *Service) AnalyzeVideo(ctx context.Context, videoID uuid.UUID) ([]detection.Detection, error) {
 	visualStart := time.Now()
-	frames, err := s.frameRepo.GetByVideoID(ctx, videoID)
+	// Production YOLO consumes the perception frame set exclusively (the
+	// regular fixed-rate sampling cadence), never the semantic set.
+	frames, err := s.frameRepo.GetByVideoIDSet(ctx, videoID, video_frame.SetPerception)
 	if err != nil {
 		return nil, fmt.Errorf("get frames: %w", err)
 	}
@@ -267,7 +269,8 @@ func (s *Service) NewDetectionSession(ctx context.Context) (*detector.Session, e
 }
 
 func (s *Service) AnalyzeSegment(ctx context.Context, videoID, segmentID uuid.UUID) ([]detection.Detection, error) {
-	frames, err := s.frameRepo.GetBySegmentID(ctx, segmentID)
+	// Production YOLO frames: perception set (see AnalyzeVideo).
+	frames, err := s.frameRepo.GetBySegmentIDSet(ctx, segmentID, video_frame.SetPerception)
 	if err != nil {
 		return nil, fmt.Errorf("get frames for segment %s: %w", segmentID, err)
 	}
@@ -289,7 +292,8 @@ func (s *Service) AnalyzeSegment(ctx context.Context, videoID, segmentID uuid.UU
 }
 
 func (s *Service) AnalyzeSegmentWithSession(ctx context.Context, videoID, segmentID uuid.UUID, sess *detector.Session) ([]detection.Detection, error) {
-	frames, err := s.frameRepo.GetBySegmentID(ctx, segmentID)
+	// Production YOLO frames: perception set (see AnalyzeVideo).
+	frames, err := s.frameRepo.GetBySegmentIDSet(ctx, segmentID, video_frame.SetPerception)
 	if err != nil {
 		return nil, fmt.Errorf("get frames for segment %s: %w", segmentID, err)
 	}
@@ -644,4 +648,13 @@ func (s *Service) GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]detect
 
 func (s *Service) DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error {
 	return s.detectionRepo.DeleteByVideoID(ctx, videoID)
+}
+
+// DeleteDetectionsByFrameIDs removes production detections attached to the
+// given frames. The perception regeneration's orchestrator uses it after
+// frames leave the perception set (former 'both' rows demoted to
+// semantic-only), since their persisted detections can no longer be
+// refreshed by a detection pass.
+func (s *Service) DeleteDetectionsByFrameIDs(ctx context.Context, frameIDs []uuid.UUID) error {
+	return s.detectionRepo.DeleteByFrameIDs(ctx, frameIDs)
 }

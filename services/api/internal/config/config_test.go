@@ -82,6 +82,25 @@ func TestSamplerTimeoutSane(t *testing.T) {
 	}
 }
 
+// TestPerceptionSampleFPSRows: perception cadence defaults to 0.5 FPS
+// (2-second interval, the legacy baseline density), parses finite positive
+// values, and rejects everything else. The semantic sampler's budget keys
+// must not influence it.
+func TestPerceptionSampleFPSMatrix(t *testing.T) {
+	if cfg := Load(); cfg.PerceptionSampleFPS != 0.5 {
+		t.Fatalf("perception fps default must be 0.5, got %v", cfg.PerceptionSampleFPS)
+	}
+	t.Setenv("PERCEPTION_SAMPLE_FPS", "2")
+	if cfg := Load(); cfg.PerceptionSampleFPS != 2 {
+		t.Fatalf("perception fps must parse, got %v", cfg.PerceptionSampleFPS)
+	}
+	mustPanic(t, "PERCEPTION_SAMPLE_FPS", "0")
+	mustPanic(t, "PERCEPTION_SAMPLE_FPS", "-1")
+	mustPanic(t, "PERCEPTION_SAMPLE_FPS", "abc")
+	mustPanic(t, "PERCEPTION_SAMPLE_FPS", "inf")
+}
+
+
 func TestRerankerBackendDefaults(t *testing.T) {
 	cfg := Load()
 	if cfg.RerankerBackend != "torch" {

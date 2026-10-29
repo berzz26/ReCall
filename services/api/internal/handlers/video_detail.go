@@ -80,7 +80,9 @@ func (h *VideoDetailHandler) GetFrames(c *fiber.Ctx) error {
 	}
 	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
 	defer cancel()
-	frames, err := h.frameRepo.GetByVideoID(ctx, id)
+	// UI frame strip pairs detections with frames by frame_id; both live on
+	// the perception timeline, so serve the perception set.
+	frames, err := h.frameRepo.GetByVideoIDSet(ctx, id, video_frame.SetPerception)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "failed"})
 	}

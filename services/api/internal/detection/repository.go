@@ -104,6 +104,22 @@ func (r *Repository) DeleteByFrameID(ctx context.Context, frameID uuid.UUID) err
 	return err
 }
 
+// DeleteByFrameIDs removes the detections of multiple frames in one round
+// trip (batch version of DeleteByFrameID). Used by the orchestrator to clean
+// stale production detections on frames that left the perception set during
+// a perception regeneration.
+func (r *Repository) DeleteByFrameIDs(ctx context.Context, frameIDs []uuid.UUID) error {
+	if len(frameIDs) == 0 {
+		return nil
+	}
+	ids := make([]string, len(frameIDs))
+	for i, id := range frameIDs {
+		ids[i] = id.String()
+	}
+	_, err := r.db.Exec(ctx, `DELETE FROM video_frame_detections WHERE frame_id = ANY($1)`, ids)
+	return err
+}
+
 func (r *Repository) GetBySegmentID(ctx context.Context, segmentID uuid.UUID) ([]Detection, error) {
 	query := fmt.Sprintf(`SELECT %s FROM video_frame_detections WHERE segment_id = $1 ORDER BY created_at ASC, id ASC`, fields)
 	rows, err := r.db.Query(ctx, query, segmentID)

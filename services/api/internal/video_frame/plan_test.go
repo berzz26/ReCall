@@ -3,6 +3,7 @@ package video_frame
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -38,6 +39,57 @@ func (f *fakeRepo) GetByVideoID(_ context.Context, videoID uuid.UUID) ([]VideoFr
 		out = []VideoFrame{}
 	}
 	return out, nil
+}
+
+func (f *fakeRepo) GetByVideoIDSet(_ context.Context, videoID uuid.UUID, set Set) ([]VideoFrame, error) {
+	var out []VideoFrame
+	for _, fr := range f.frames {
+		if fr.VideoID == videoID && fr.Purpose.Owns(set) {
+			out = append(out, fr)
+		}
+	}
+	if out == nil {
+		out = []VideoFrame{}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) GetBySegmentIDSet(_ context.Context, segmentID uuid.UUID, set Set) ([]VideoFrame, error) {
+	var out []VideoFrame
+	for _, fr := range f.frames {
+		if fr.SegmentID == segmentID && fr.Purpose.Owns(set) {
+			out = append(out, fr)
+		}
+	}
+	if out == nil {
+		out = []VideoFrame{}
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) UpdatePurpose(_ context.Context, frameID uuid.UUID, purpose Purpose) error {
+	for i := range f.frames {
+		if f.frames[i].ID == frameID {
+			f.frames[i].Purpose = purpose
+			return nil
+		}
+	}
+	return fmt.Errorf("fakeRepo: frame %s not found", frameID)
+}
+
+func (f *fakeRepo) DeleteByIDs(_ context.Context, ids []uuid.UUID) error {
+	drop := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+	kept := f.frames[:0]
+	for _, fr := range f.frames {
+		if !drop[fr.ID] {
+			kept = append(kept, fr)
+		}
+	}
+	f.frames = kept
+	return nil
 }
 
 func (f *fakeRepo) DeleteByVideoID(_ context.Context, videoID uuid.UUID) error {

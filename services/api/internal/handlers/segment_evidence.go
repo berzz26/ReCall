@@ -74,7 +74,7 @@ func (h *SegmentEvidenceHandler) GetEvidence(c *fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "segment not found for video"})
 	}
 
-	frames, err := h.frameRepo.GetBySegmentID(ctx, sid)
+	frames, err := h.frameRepo.GetBySegmentIDSet(ctx, sid, video_frame.SetPerception)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "failed"})
 	}

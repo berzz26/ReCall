@@ -59,7 +59,13 @@ func (s *Service) GenerateForVideo(ctx context.Context, videoID uuid.UUID) ([]De
 		return s.repo.ReplaceForVideo(ctx, videoID, nil)
 	}
 	slog.Info("segment_description: start", "video_id", videoID.String(), "segments", len(segments))
-	frames, err := s.frameRepo.GetByVideoID(ctx, videoID)
+	// VLM inputs are assembled from the SEMANTIC frame set only — the
+	// adaptive sampler decides which timestamps deserve description.
+	frames, err := s.frameRepo.GetByVideoIDSet(ctx, videoID, video_frame.SetSemantic)
+	if err != nil {
+		return nil, err
+	}
+	perceptionFrames, err := s.frameRepo.GetByVideoIDSet(ctx, videoID, video_frame.SetPerception)
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +82,16 @@ func (s *Service) GenerateForVideo(ctx context.Context, videoID uuid.UUID) ([]De
 		return nil, err
 	}
 
+	// frameByID resolves the timestamps of production detections and
+	// persistence-line history labels. Detections live on the perception
+	// timeline, which may contain frames the semantic set never selected;
+	// the map is therefore the union of both sets, and no detection
+	// timestamp is assumed from semantic frames it is not attached to.
 	frameByID := map[uuid.UUID]video_frame.VideoFrame{}
 	for _, f := range frames {
+		frameByID[f.ID] = f
+	}
+	for _, f := range perceptionFrames {
 		frameByID[f.ID] = f
 	}
 

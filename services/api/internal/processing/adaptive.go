@@ -53,11 +53,13 @@ import (
 )
 
 // VideoFrameExtractor is the frame-extraction surface the orchestrator
-// needs. *video_frame.Service satisfies it; tests inject fakes.
+// needs. *video_frame.Service satisfies it; tests inject fakes. The resume
+// check queries the SEMANTIC set: the perception set's rows share the same
+// video and must never satisfy semantic resume.
 type VideoFrameExtractor interface {
 	GenerateForVideoWithPlan(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, plan sampler.SamplingPlan, width, height int) ([]video_frame.VideoFrame, error)
 	ExtractAdditional(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, timestamps []float64, durationSeconds float64, width, height int) ([]video_frame.VideoFrame, error)
-	GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]video_frame.VideoFrame, error)
+	GetByVideoIDSet(ctx context.Context, videoID uuid.UUID, set video_frame.Set) ([]video_frame.VideoFrame, error)
 }
 
 // PlanningDetector is the ephemeral planning-detection surface.
@@ -199,7 +201,7 @@ func (a *AdaptiveSampler) PlanAndExtract(ctx context.Context, v *video.Video, se
 		if err := ctx.Err(); err != nil {
 			return nil, stats, err
 		}
-		existing, err := a.frames.GetByVideoID(ctx, v.ID)
+		existing, err := a.frames.GetByVideoIDSet(ctx, v.ID, video_frame.SetSemantic)
 		if err == nil && len(existing) > 0 {
 			stats.Mode = "resume"
 			stats.Resumed = true

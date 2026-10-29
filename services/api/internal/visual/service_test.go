@@ -185,6 +185,11 @@ func TestDetectFramesEphemeral(t *testing.T) {
 	if _, err := frameRepo.CreateBatch(ctx, frames); err != nil {
 		t.Fatalf("CreateBatch frames: %v", err)
 	}
+	// Use the saved rows: only they carry the newly assigned frame IDs.
+	frames, err = frameRepo.GetByVideoID(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("GetByVideoID frames: %v", err)
+	}
 	defer func() {
 		vs.DeleteByVideoID(ctx, v.ID)
 		frameSvc.DeleteByVideoID(ctx, v.ID)

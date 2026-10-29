@@ -38,19 +38,32 @@ Anything not set falls back to the built-in default listed below.
 
 ## 3. Frame sampler
 
-ReCall does **not** run object detection on every frame. The sampler picks which
-timestamps get extracted as JPEGs and sent to YOLO. Two modes:
+ReCall distinguishes **two independent frame sets**, extracted once and stored
+per timestamp (a timestamp selected by both policies reuses a single stored
+frame):
 
-- **Baseline**: one frame every `FRAME_SAMPLE_INTERVAL`. Simple, predictable.
-- **Adaptive** (default): a cheap visual scan finds the busy moments, then YOLO
-  frames are concentrated there — same total count, better coverage.
+- **Perception set** — the regular fixed-rate cadence that production YOLO,
+  ByteTrack tracking, event generation, and the frame UI consume. Configured
+  by `PERCEPTION_SAMPLE_FPS` alone; never influenced by the adaptive sampler's
+  selections.
+- **Semantic set** — the frames sent to the VLM for video description. Selected
+  by the adaptive sampler (or the baseline grid when `SAMPLER_ADAPTIVE=false`),
+  which concentrates expensive VLM frames on the busy moments.
 
-The budget invariant always holds: total YOLO frames ≤ `N_baseline`, where
-`N_baseline = ceil(video_duration / FRAME_SAMPLE_INTERVAL)`.
+Detection and tracking therefore keep observations on a steady, configurable
+cadence even through stretches the adaptive sampler classifies as inactive,
+while the VLM still gets a curated selection.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `FRAME_SAMPLE_INTERVAL` | `2s` | Baseline grid spacing. Also defines the budget `N_baseline` for adaptive mode. Smaller = more frames = more GPU cost. |
+| `PERCEPTION_SAMPLE_FPS` | `0.5` | Perception-set sampling rate (frames per second, must be finite and > 0). `0.5` = one frame every 2s. Selected timestamps regenerate idempotently: reprocessing reuses every stored frame that still matches the grid and removes stale rows without re-extracting or re-encoding. |
+
+The semantic-side budget invariant still holds: total semantic frames ≤
+`N_baseline`, where `N_baseline = ceil(video_duration / FRAME_SAMPLE_INTERVAL)`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FRAME_SAMPLE_INTERVAL` | `2s` | Baseline grid spacing for the semantic sampler. Also defines the budget `N_baseline` for adaptive mode. Smaller = more frames = more GPU cost. |
 | `SAMPLER_BETA` | `1.0` | Budget multiplier: budget `B = ceil(beta × N_baseline)`. `1.0` = same frame count as baseline. Below `1.0` = cheaper, sparser coverage. |
 | `FRAME_JPEG_QUALITY` | `85` | JPEG quality (1–100) of extracted frames. Higher = bigger files on disk and slightly better detection, with diminishing returns past ~85. |
 | `SAMPLER_ADAPTIVE` | `true` | Master switch. `false` = exact legacy fixed-interval plan (use in production if you are not ready for adaptive sampling). |
@@ -132,8 +145,8 @@ midpoint. Gap priority = `max(tracker_disagreement, gamma × probe_rank) × gap`
 
 ### 5.1 Sparse-video association (ByteTrack)
 
-Sampled YOLO frames can be seconds apart (`FRAME_SAMPLE_INTERVAL`, adaptive
-sampler), so once the time between two frames exceeds
+Sampled YOLO frames can be seconds apart (`PERCEPTION_SAMPLE_FPS`), so once
+the time between two frames exceeds
 `TRACKER_SPARSE_DT_THRESHOLD` the tracker switches from the strict
 Kalman/IoU gating (calibrated for ~30 FPS video) to a dt-aware spatial
 gate: a detection joins a track if it is within the drift allowance of the

@@ -9,6 +9,7 @@ import (
 	_ "image/jpeg"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +32,11 @@ import (
 // *Repository so existing call sites are unaffected.
 type frameRepository interface {
 	GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error)
+	GetByVideoIDSet(ctx context.Context, videoID uuid.UUID, set Set) ([]VideoFrame, error)
+	GetBySegmentIDSet(ctx context.Context, segmentID uuid.UUID, set Set) ([]VideoFrame, error)
 	DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error
+	UpdatePurpose(ctx context.Context, frameID uuid.UUID, purpose Purpose) error
+	DeleteByIDs(ctx context.Context, ids []uuid.UUID) error
 	CreateBatch(ctx context.Context, frames []VideoFrame) ([]VideoFrame, error)
 }
 
@@ -53,6 +58,12 @@ const (
 	extractStepBack    = 0.5
 	extractMaxStepBack = 2.0
 )
+
+// frameTSEpsilon is the timestamp-matching tolerance for membership walks: an
+// existing frame whose timestamp is within this epsilon of a requested
+// timestamp reuses its stored asset instead of being re-extracted. It matches
+// the sampler's dedupe epsilon and the orchestration matching tolerance.
+const frameTSEpsilon = 1e-6
 
 // extractFunc extracts one frame at the given timestamp and returns the
 // JPEG bytes. It is a field (not a hard ffmpeg call) so tests can stub the
@@ -85,6 +96,11 @@ type Service struct {
 	// with an adaptive plan (e.g. the visual-probe coarse planner). The
 	// extractor still only consumes the resulting timestamp list.
 	videoPlanner sampler.VideoPlanner
+	// perceptionInterval is the fixed perception-sampling interval
+	// (PERCEPTION_SAMPLE_FPS). It is fully independent of the semantic
+	// sampler's sampleInterval: a stationary scene still gets perception
+	// observations at this rate.
+	perceptionInterval time.Duration
 }
 
 func NewService(repo *Repository, store storage.Storage, sampleInterval time.Duration, ffmpegPath string, ffmpegTimeout time.Duration, jpegQuality int) *Service {
@@ -100,7 +116,17 @@ func NewService(repo *Repository, store storage.Storage, sampleInterval time.Dur
 	if jpegQuality < 1 || jpegQuality > 100 {
 		jpegQuality = 85
 	}
-	return &Service{repo: repo, storage: store, sampleInterval: sampleInterval, ffmpegPath: ffmpegPath, ffmpegTimeout: ffmpegTimeout, jpegQuality: jpegQuality, samplerBeta: sampler.DefaultBeta, extractOne: extractSingleFrame}
+	return &Service{
+		repo:               repo,
+		storage:            store,
+		sampleInterval:     sampleInterval,
+		perceptionInterval: 2 * time.Second,
+		ffmpegPath:         ffmpegPath,
+		ffmpegTimeout:      ffmpegTimeout,
+		jpegQuality:        jpegQuality,
+		samplerBeta:        sampler.DefaultBeta,
+		extractOne:         extractSingleFrame,
+	}
 }
 
 // WithExtractWorkers sets the max concurrent ffmpeg decodes (<=0 = auto)
@@ -136,6 +162,18 @@ func defaultExtractWorkers() int {
 func (s *Service) WithSamplerBeta(beta float64) *Service {
 	if beta > 0 {
 		s.samplerBeta = beta
+	}
+	return s
+}
+
+// WithPerceptionSampleFPS sets the fixed perception sampling rate and returns
+// the service for chaining. fps <= 0 keeps the current setting (invalid
+// values are rejected by config validation). The default is 2s (0.5 fps).
+func (s *Service) WithPerceptionSampleFPS(fps float64) *Service {
+	if fps > 0 {
+		if interval := time.Duration(float64(time.Second) / fps); interval > 0 {
+			s.perceptionInterval = interval
+		}
 	}
 	return s
 }
@@ -193,8 +231,8 @@ func (s *Service) WithVideoPlanner(p sampler.VideoPlanner) *Service {
 
 // GenerateForVideo is the legacy entry point. It now builds an explicit
 // baseline sampling plan (fixed 2-second grid, budget-capped) and delegates
-// to GenerateForVideoWithPlan, so effective frames are unchanged while the
-// planner/extractor separation is in force.
+// to GenerateForVideoWithPlan, so the semantic set it produces is unchanged
+// while the planner/extractor separation is in force.
 func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, durationSeconds float64, width, height int) ([]VideoFrame, error) {
 	if s.videoPlanner != nil {
 		// Adaptive path: plan from the concrete video file, then extract
@@ -221,13 +259,19 @@ func (s *Service) GenerateForVideo(ctx context.Context, v *video.Video, segments
 	return s.GenerateForVideoWithPlan(ctx, v, segments, plan, width, height)
 }
 
-// GenerateForVideoWithPlan materializes an explicit sampling plan: it
-// extracts exactly the plan's (normalized, budget-capped) timestamps as
-// VideoFrame objects. It never decides which frames are important; that is
-// the planner's job. The returned VideoFrame shape is unchanged, so YOLO,
-// ByteTrack, events, VLM, and embeddings are unaffected.
+// GenerateForVideoWithPlan materializes the SEMANTIC frame set from an
+// explicit adaptive-sampling plan: it replaces the semantic set's membership
+// with exactly the plan's (normalized, budget-capped) timestamps. It never
+// decides which frames are important; that is the planner's job.
+//
+// Replacement is membership-aware: frames of the perception set (or shared
+// 'both' frames outside the plan) are never deleted or detached. A plan
+// timestamp whose row already exists is re-used without re-extraction
+// (promoted to 'both' when it was perception-only). Set-owning rows the plan
+// drops are deleted; shared 'both' rows the plan drops are demoted to
+// perception-only. The returned shape is unchanged, so YOLO, ByteTrack,
+// events, VLM, and embeddings are unaffected.
 func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, plan sampler.SamplingPlan, width, height int) ([]VideoFrame, error) {
-	frameStart := time.Now()
 	if s.storage == nil {
 		return nil, fmt.Errorf("storage not configured")
 	}
@@ -253,6 +297,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 
 	slog.Info("frame: plan",
 		"video_id", v.ID.String(),
+		"set", PurposeSemantic,
 		"mode", plan.Mode,
 		"duration_seconds", plan.DurationSeconds,
 		"baseline_count", plan.Budget.BaselineCount,
@@ -263,34 +308,206 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		"ffmpeg", s.ffmpegPath, "jpeg_quality", s.jpegQuality,
 	)
 
-	// Replace previously extracted frames (idempotent regeneration),
-	// mirroring legacy behavior.
+	outcome, err := s.replaceFrameSet(ctx, v, segments, timestamps, plan.DurationSeconds, PurposeSemantic, PurposePerception, width, height)
+	if err != nil {
+		return nil, err
+	}
+	return outcome.Frames, nil
+}
+
+// PerceptionResult is the outcome of a perception-set replacement. Frames is
+// the full perception membership after the walk; DroppedFrameIDs lists rows
+// demoted out of the perception set (former 'both' rows now semantic-only):
+// their previously persisted production detections are stale for the new
+// cadence and the orchestrator deletes them before running production
+// detection.
+type PerceptionResult struct {
+	Frames          []VideoFrame
+	DroppedFrameIDs []uuid.UUID
+}
+
+// GeneratePerceptionForVideo materializes the PERCEPTION frame set: a
+// regular, fixed-rate grid at the configured perception interval
+// (PERCEPTION_SAMPLE_FPS, default 0.5 fps = 2s). It never consults the
+// adaptive sampler — a stationary scene still gets observations at the
+// configured rate — and it never deletes or detaches the semantic set's
+// membership (timestamps shared with the semantic set reuse a single row as
+// 'both').
+func (s *Service) GeneratePerceptionForVideo(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, durationSeconds float64, width, height int) (*PerceptionResult, error) {
+	if s.storage == nil {
+		return nil, fmt.Errorf("storage not configured")
+	}
+	if len(segments) == 0 {
+		return nil, fmt.Errorf("no segments available for frame association")
+	}
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions")
+	}
+
+	targets, err := sampler.BaselineTimestamps(durationSeconds, s.perceptionInterval)
+	if err != nil {
+		return nil, err
+	}
+	targets = sampler.NormalizeTimestamps(targets, durationSeconds)
+
+	slog.Info("frame: perception plan",
+		"video_id", v.ID.String(),
+		"set", PurposePerception,
+		"duration_seconds", durationSeconds,
+		"interval_seconds", s.perceptionInterval.Seconds(),
+		"requested", len(targets),
+		"width", width, "height", height,
+		"ffmpeg", s.ffmpegPath, "jpeg_quality", s.jpegQuality,
+	)
+
+	outcome, err := s.replaceFrameSet(ctx, v, segments, targets, durationSeconds, PurposePerception, PurposeSemantic, width, height)
+	if err != nil {
+		return nil, err
+	}
+	return &PerceptionResult{Frames: outcome.Frames, DroppedFrameIDs: outcome.DroppedFrameIDs}, nil
+}
+
+// setWalkOutcome reports the result of replacing one frame set's membership.
+type setWalkOutcome struct {
+	// Frames is the full membership of the regenerated set after the walk,
+	// in target-timestamp order (reused rows first-class with freshly
+	// extracted ones; skipped phantom-tail timestamps absent).
+	Frames []VideoFrame
+	// DroppedFrameIDs are rows demoted OUT of the regenerated set (former
+	// 'both' rows now owned by the other set only). Deleted rows are not
+	// listed: their dependent detections leave via FK cascade with the row.
+	DroppedFrameIDs []uuid.UUID
+}
+
+// replaceFrameSet replaces the membership of one frame set (target) with
+// exactly the given timestamps, leaving the other set (other) untouched.
+//
+// The walk, evaluated entirely before any mutation:
+//
+//	matched row (|ts - target| < eps):     member; reuse the stored asset,
+//	                                       never re-extract (promoted to
+//	                                       'both' when owned by the other
+//	                                       set only).
+//	unmatched, purpose == target:          delete row + asset (attached
+//	                                       production detections leave via
+//	                                       FK cascade).
+//	unmatched, purpose == both:            demote to other-only; asset and
+//	                                       the other set's membership
+//	                                       survive; its production
+//	                                       detections may become stale
+//	                                       (surfaced as DroppedFrameIDs).
+//	unmatched, purpose == other:           untouched (other set's row).
+//	timestamp with no matching row:        freshly extracted as target.
+//
+// Mutations are applied in a fixed order — deletes (rows then assets),
+// demotions, promotions, extraction+insertion — so a database failure aborts
+// before extraction allocates work. On later failure, cleanup removes ONLY
+// rows/assets created by this call: the other set and pre-existing rows
+// always survive a failed regeneration.
+func (s *Service) replaceFrameSet(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, targets []float64, durationSeconds float64, target, other Purpose, width, height int) (*setWalkOutcome, error) {
+	runStart := time.Now()
 	existing, err := s.repo.GetByVideoID(ctx, v.ID)
 	if err != nil {
 		return nil, err
 	}
-	var oldKeys []string
+
+	out := &setWalkOutcome{}
+	rowByTarget := make([]*VideoFrame, len(targets))
+	var toDelete []VideoFrame
+	var toDemote []VideoFrame
+	var toPromote []VideoFrame
+	// First ownership pass: classify every existing row. `claim` prevents
+	// two rows claiming the same target; ties resolve deterministically by
+	// the repository's chronological order.
+	claim := make([]bool, len(targets))
+	for i := range existing {
+		f := existing[i] // loop-local copy; pointer stored when matched
+		match := -1
+		for j, want := range targets {
+			if claim[j] {
+				continue
+			}
+			if math.Abs(f.TimestampSeconds-want) < frameTSEpsilon {
+				match = j
+				break
+			}
+		}
+		if match < 0 {
+			switch f.Purpose.resolve() {
+			case target:
+				toDelete = append(toDelete, f)
+			case PurposeBoth:
+				f.Purpose = other
+				toDemote = append(toDemote, f)
+			default:
+				// other set's row: untouched
+			}
+			continue
+		}
+		claim[match] = true
+		if f.Purpose.resolve() == other {
+			f.Purpose = PurposeBoth
+			toPromote = append(toPromote, f)
+		}
+		rowByTarget[match] = &f
+	}
+
+	// FrameIndex base = max remaining index + 1 (deleted rows do not count).
+	delIDs := make([]uuid.UUID, 0, len(toDelete))
+	delSet := make(map[uuid.UUID]bool, len(toDelete))
+	for _, f := range toDelete {
+		delIDs = append(delIDs, f.ID)
+		delSet[f.ID] = true
+	}
+	frameIdxBase := 0
 	for _, f := range existing {
-		oldKeys = append(oldKeys, f.StorageKey)
-	}
-	if len(existing) > 0 {
-		if err := s.repo.DeleteByVideoID(ctx, v.ID); err != nil {
-			return nil, fmt.Errorf("failed to delete old frames: %w", err)
+		if delSet[f.ID] {
+			continue
 		}
-		for _, k := range oldKeys {
-			_ = s.storage.Delete(ctx, k)
+		if f.FrameIndex+1 > frameIdxBase {
+			frameIdxBase = f.FrameIndex + 1
 		}
 	}
 
-	if len(timestamps) == 0 {
-		slog.Info("frame: complete (empty plan)", "video_id", v.ID.String(), "frame_count", 0)
-		return []VideoFrame{}, nil
+	// Mutation phase 1: deletes (detections cascade), then asset removal,
+	// then demotions and promotions.
+	if len(delIDs) > 0 {
+		if err := s.repo.DeleteByIDs(ctx, delIDs); err != nil {
+			return nil, fmt.Errorf("failed to delete replaced %s frames: %w", target, err)
+		}
+		for _, f := range toDelete {
+			_ = s.storage.Delete(ctx, f.StorageKey)
+		}
+	}
+	for _, f := range toDemote {
+		if err := s.repo.UpdatePurpose(ctx, f.ID, other); err != nil {
+			return nil, fmt.Errorf("failed to demote shared frame: %w", err)
+		}
+		out.DroppedFrameIDs = append(out.DroppedFrameIDs, f.ID)
+	}
+	for _, f := range toPromote {
+		if err := s.repo.UpdatePurpose(ctx, f.ID, PurposeBoth); err != nil {
+			return nil, fmt.Errorf("failed to adopt frame into %s set: %w", target, err)
+		}
 	}
 
-	// Batch extraction: the source video path is resolved ONCE for the whole
-	// timestamp batch, then each timestamp is seek-extracted. Seeking (rather
-	// than decoding the entire video and discarding frames) keeps sparse
-	// future plans cheap; dense baseline plans decode only what they need.
+	var fresh []float64
+	for j := range targets {
+		if rowByTarget[j] == nil {
+			fresh = append(fresh, targets[j])
+		}
+	}
+
+	if len(fresh) == 0 {
+		out.Frames = membershipInTargetOrder(rowByTarget)
+		slog.Info("frame: complete (no new extraction needed)",
+			"video_id", v.ID.String(), "set", target, "frame_count", len(out.Frames))
+		return out, nil
+	}
+
+	// Extraction phase: the source video path is resolved ONCE for the whole
+	// timestamp batch, then each timestamp is seek-extracted (see the
+	// semantic extraction notes above; semantics unchanged).
 	videoPath, cleanupVideo, err := s.resolveVideoPath(ctx, v)
 	if err != nil {
 		return nil, err
@@ -300,6 +517,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 	}
 
 	var createdKeys []string
+	var createdIDs []uuid.UUID
 	var batch []VideoFrame
 	var allSaved []VideoFrame
 	var totalExtractMs int64
@@ -307,10 +525,15 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 	var persistMs int64
 
 	cleanupOnFail := func() {
+		// Remove ONLY what this call created: the other frame set and the
+		// pre-existing rows already mutated above must never be destroyed by
+		// a failed regeneration.
 		for _, k := range createdKeys {
 			_ = s.storage.Delete(ctx, k)
 		}
-		_ = s.repo.DeleteByVideoID(ctx, v.ID)
+		if len(createdIDs) > 0 {
+			_ = s.repo.DeleteByIDs(ctx, createdIDs)
+		}
 	}
 
 	persistBatch := func() error {
@@ -323,15 +546,15 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		if err != nil {
 			return err
 		}
+		for i := range saved {
+			createdIDs = append(createdIDs, saved[i].ID)
+		}
 		allSaved = append(allSaved, saved...)
 		batch = batch[:0]
 		return nil
 	}
 
-	// Parallel decode phase: up to effectiveWorkers() concurrent ffmpeg
-	// processes, results in timestamp order. Saving stays sequential below
-	// so storage keys, FrameIndex assignment, and DB batches are unchanged.
-	results, err := s.extractAllOrdered(ctx, videoPath, timestamps, plan.DurationSeconds)
+	results, err := s.extractAllOrdered(ctx, videoPath, fresh, durationSeconds)
 	if err != nil {
 		var xerr *extractError
 		ts := 0.0
@@ -351,8 +574,9 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
 	}
 
+	createdByTS := make(map[float64]VideoFrame, len(fresh))
 	for i := range results {
-		ts := timestamps[i]
+		ts := fresh[i]
 		if err := ctx.Err(); err != nil {
 			cleanupOnFail()
 			return nil, err
@@ -375,7 +599,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			fw = cfg.Width
 			fh = cfg.Height
 		}
-		frameIdx := len(allSaved) + len(batch)
+		frameIdx := frameIdxBase + len(allSaved) + len(batch)
 		key := frameStorageKey(v.ID, frameIdx)
 		saveStart := time.Now()
 		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
@@ -384,7 +608,7 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		}
 		totalSaveMs += time.Since(saveStart).Milliseconds()
 		createdKeys = append(createdKeys, key)
-		batch = append(batch, VideoFrame{
+		frame := VideoFrame{
 			VideoID:          v.ID,
 			SegmentID:        seg.ID,
 			FrameIndex:       frameIdx,
@@ -392,7 +616,9 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			StorageKey:       key,
 			Width:            fw,
 			Height:           fh,
-		})
+			Purpose:          target,
+		}
+		batch = append(batch, frame)
 		if len(batch) >= 500 {
 			if err := persistBatch(); err != nil {
 				cleanupOnFail()
@@ -400,33 +626,38 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 			}
 		}
 		if (i+1)%1000 == 0 {
-			slog.Info("frame: progress", "video_id", v.ID.String(), "frames", i+1, "timestamp", ts, "elapsed_ms", time.Since(frameStart).Milliseconds())
+			slog.Info("frame: progress", "video_id", v.ID.String(), "set", target, "frames", i+1, "timestamp", ts, "elapsed_ms", time.Since(runStart).Milliseconds())
 		}
 	}
 
 	if err := persistBatch(); err != nil {
 		cleanupOnFail()
-		slog.Error("frame: persist failed", "video_id", v.ID.String(), "duration_ms", persistMs, "error", err)
+		slog.Error("frame: persist failed", "video_id", v.ID.String(), "set", target, "duration_ms", persistMs, "error", err)
 		return nil, fmt.Errorf("failed to persist frames: %w", err)
 	}
 
-	// Contract guarantee: never return more frames than the plan requested.
-	if len(allSaved) > len(plan.Entries) {
-		allSaved = allSaved[:len(plan.Entries)]
+	for _, f := range allSaved {
+		createdByTS[f.TimestampSeconds] = f
 	}
+	out.Frames = mergeMembership(rowByTarget, createdByTS, targets)
 
-	totalMs := time.Since(frameStart).Milliseconds()
+	totalMs := time.Since(runStart).Milliseconds()
 	var finalTimestamp float64
-	if len(allSaved) > 0 {
-		finalTimestamp = allSaved[len(allSaved)-1].TimestampSeconds
+	if len(out.Frames) > 0 {
+		finalTimestamp = out.Frames[len(out.Frames)-1].TimestampSeconds
 	}
 	var avgMs float64
-	if len(allSaved) > 0 {
-		avgMs = float64(totalMs) / float64(len(allSaved))
+	if len(out.Frames) > 0 {
+		avgMs = float64(totalMs) / float64(len(out.Frames))
 	}
 	slog.Info("frame: complete",
 		"video_id", v.ID.String(),
-		"frame_count", len(allSaved),
+		"set", target,
+		"frame_count", len(out.Frames),
+		"reused", len(out.Frames)-len(allSaved),
+		"extracted", len(allSaved),
+		"demoted_out", len(toDemote),
+		"deleted", len(toDelete),
 		"total_duration_ms", totalMs,
 		"extract_total_ms", totalExtractMs,
 		"save_total_ms", totalSaveMs,
@@ -434,7 +665,37 @@ func (s *Service) GenerateForVideoWithPlan(ctx context.Context, v *video.Video, 
 		"avg_ms_per_frame", avgMs,
 		"final_timestamp", finalTimestamp,
 	)
-	return allSaved, nil
+	return out, nil
+}
+
+// membershipInTargetOrder assembles the final membership list in target
+// timestamp order from the matched rows (reused only; extracted frames are
+// merged in later via mergeMembership). Called only when every target
+// matched an existing row (len(fresh) == 0).
+func membershipInTargetOrder(rowByTarget []*VideoFrame) []VideoFrame {
+	out := make([]VideoFrame, 0, len(rowByTarget))
+	for _, row := range rowByTarget {
+		if row != nil {
+			out = append(out, *row)
+		}
+	}
+	return out
+}
+
+// mergeMembership assembles the final membership list in target timestamp
+// order, combining reused rows and freshly extracted frames.
+func mergeMembership(rowByTarget []*VideoFrame, createdByTS map[float64]VideoFrame, targets []float64) []VideoFrame {
+	out := make([]VideoFrame, 0, len(targets))
+	for j, row := range rowByTarget {
+		if row != nil {
+			out = append(out, *row)
+			continue
+		}
+		if f, ok := createdByTS[targets[j]]; ok {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // resolveVideoPath maps a video to a local file path, downloading uploaded
@@ -738,11 +999,20 @@ func (s *Service) extractResilient(ctx context.Context, videoPath string, timest
 }
 
 // ExtractAdditional extracts extra timestamps WITHOUT deleting existing
-// frames, for adaptive refinement rounds. Timestamps are normalized
-// (sorted, deduplicated, range-checked); already-extracted timestamps are
-// skipped so no frame is ever processed twice. FrameIndex and storage keys
-// continue after the existing frames. Unlike GenerateForVideoWithPlan it
-// applies no budget cap: the refinement planner owns budget accounting.
+// frames, for adaptive semantic refinement rounds. Timestamps are normalized
+// (sorted, deduplicated, range-checked). Membership-aware classification:
+//
+//   - a row already in the semantic set ('semantic' or 'both') is skipped:
+//     never re-extracted and NOT returned (the refiner only sees what it
+//     still needs);
+//   - a perception-only row is adopted into the semantic set (promoted to
+//     'both', asset reused, no re-extraction) and IS returned, so the
+//     refiner still gets the midpoint observations it asked about;
+//   - anything else is freshly extracted as a semantic frame.
+//
+// FrameIndex and storage keys continue after the remaining frames. Unlike
+// GenerateForVideoWithPlan it applies no budget cap: the refinement planner
+// owns budget accounting.
 func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, timestamps []float64, durationSeconds float64, width, height int) ([]VideoFrame, error) {
 	if s.storage == nil {
 		return nil, fmt.Errorf("storage not configured")
@@ -762,30 +1032,55 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 	if err != nil {
 		return nil, err
 	}
-	done := make(map[float64]bool, len(existing))
 	base := 0
 	for _, f := range existing {
-		done[f.TimestampSeconds] = true
-		if f.FrameIndex >= base {
+		if f.FrameIndex+1 > base {
 			base = f.FrameIndex + 1
 		}
 	}
+
 	var fresh []float64
+	var reused []VideoFrame
+	var toPromote []VideoFrame
+	rowClaim := make([]bool, len(existing))
 	for _, t := range want {
-		dup := false
-		for dt := range done {
-			if dt-t < 1e-6 && t-dt < 1e-6 {
-				dup = true
+		match := -1
+		for i := range existing {
+			if rowClaim[i] {
+				continue
+			}
+			if math.Abs(existing[i].TimestampSeconds-t) < frameTSEpsilon {
+				match = i
 				break
 			}
 		}
-		if !dup {
+		if match < 0 {
 			fresh = append(fresh, t)
-			done[t] = true
+			continue
 		}
+		rowClaim[match] = true
+		f := existing[match]
+		if f.Purpose.resolve() == PurposePerception {
+			f.Purpose = PurposeBoth
+			reused = append(reused, f)
+			toPromote = append(toPromote, f)
+		}
+		// 'semantic' or 'both': already in the semantic set; skip silently.
 	}
+
 	if len(fresh) == 0 {
-		return []VideoFrame{}, nil
+		if err := s.applySemanticAdoptions(ctx, toPromote); err != nil {
+			return nil, err
+		}
+		slog.Info("frame: additional extraction complete",
+			"video_id", v.ID.String(),
+			"requested", len(want),
+			"extracted", 0,
+			"adopted_from_perception", len(reused),
+			"skipped_existing", len(want)-len(reused),
+			"skipped_undecodable", 0,
+		)
+		return reused, nil
 	}
 
 	videoPath, cleanupVideo, err := s.resolveVideoPath(ctx, v)
@@ -797,10 +1092,13 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 	}
 
 	var createdKeys []string
-	var batch []VideoFrame
+	var createdIDs []uuid.UUID
 	cleanupOnFail := func() {
 		for _, k := range createdKeys {
 			_ = s.storage.Delete(ctx, k)
+		}
+		if len(createdIDs) > 0 {
+			_ = s.repo.DeleteByIDs(ctx, createdIDs)
 		}
 	}
 	results, err := s.extractAllOrdered(ctx, videoPath, fresh, durationSeconds)
@@ -813,6 +1111,8 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 		cleanupOnFail()
 		return nil, fmt.Errorf("ffmpeg failed at timestamp %f: %w", ts, err)
 	}
+	var saved []VideoFrame
+	var batch []VideoFrame
 	for i := range results {
 		ts := fresh[i]
 		if err := ctx.Err(); err != nil {
@@ -834,7 +1134,7 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			fw = cfg.Width
 			fh = cfg.Height
 		}
-		frameIdx := base + len(batch)
+		frameIdx := base + len(saved) + len(batch)
 		key := frameStorageKey(v.ID, frameIdx)
 		if err := s.storage.Save(ctx, key, bytes.NewReader(jpegBytes)); err != nil {
 			cleanupOnFail()
@@ -849,26 +1149,83 @@ func (s *Service) ExtractAdditional(ctx context.Context, v *video.Video, segment
 			StorageKey:       key,
 			Width:            fw,
 			Height:           fh,
+			Purpose:          PurposeSemantic,
 		})
 	}
-	saved, err := s.repo.CreateBatch(ctx, batch)
+	saved, err = s.repo.CreateBatch(ctx, batch)
 	if err != nil {
 		cleanupOnFail()
 		return nil, fmt.Errorf("failed to persist frames: %w", err)
+	}
+	for i := range saved {
+		createdIDs = append(createdIDs, saved[i].ID)
+	}
+	if err := s.applySemanticAdoptions(ctx, toPromote); err != nil {
+		cleanupOnFail()
+		return nil, err
+	}
+
+	// Assemble the result in requested timestamp order: adopted rows and
+	// freshly extracted frames share one list so the refiner sees exactly
+	// one entry per requested midpoint.
+	byTS := make(map[float64]VideoFrame, len(saved))
+	for _, f := range saved {
+		byTS[f.TimestampSeconds] = f
+	}
+	reusedByTS := make(map[float64]VideoFrame, len(reused))
+	for _, f := range reused {
+		reusedByTS[f.TimestampSeconds] = f
+	}
+	out := make([]VideoFrame, 0, len(want))
+	for _, t := range want {
+		if f, ok := reusedByTS[t]; ok {
+			out = append(out, f)
+			continue
+		}
+		if f, ok := byTS[t]; ok {
+			out = append(out, f)
+		}
 	}
 	slog.Info("frame: additional extraction complete",
 		"video_id", v.ID.String(),
 		"requested", len(want),
 		"extracted", len(saved),
-		"skipped_existing", len(want)-len(fresh),
+		"adopted_from_perception", len(reused),
+		"skipped_existing", len(want)-len(reused)-len(saved),
 		"skipped_undecodable", len(fresh)-len(saved),
 	)
-	return saved, nil
+	return out, nil
+}
+
+// applySemanticAdoptions persists perception→'both' promotions for timestamps
+// the semantic refinement adopted. Adoptions are applied only after the fresh
+// frames persisted successfully so a failure never leaves the semantic set
+// holding frames the refinement did not fully materialize.
+func (s *Service) applySemanticAdoptions(ctx context.Context, toPromote []VideoFrame) error {
+	for _, f := range toPromote {
+		if err := s.repo.UpdatePurpose(ctx, f.ID, PurposeBoth); err != nil {
+			return fmt.Errorf("failed to adopt perception frame into semantic set: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) GetByVideoID(ctx context.Context, videoID uuid.UUID) ([]VideoFrame, error) {
 	return s.repo.GetByVideoID(ctx, videoID)
 }
+
+// GetByVideoIDSet returns one frame set (the perception set consumed by
+// production detection/tracking, or the semantic set consumed by the VLM)
+// for checkpoint/resume checks and membership queries.
+func (s *Service) GetByVideoIDSet(ctx context.Context, videoID uuid.UUID, set Set) ([]VideoFrame, error) {
+	return s.repo.GetByVideoIDSet(ctx, videoID, set)
+}
+
+// GetBySegmentIDSet returns one frame set within a segment.
+func (s *Service) GetBySegmentIDSet(ctx context.Context, segmentID uuid.UUID, set Set) ([]VideoFrame, error) {
+	return s.repo.GetBySegmentIDSet(ctx, segmentID, set)
+}
+
 func (s *Service) DeleteByVideoID(ctx context.Context, videoID uuid.UUID) error {
 	frames, err := s.repo.GetByVideoID(ctx, videoID)
 	if err != nil {

@@ -76,6 +76,7 @@ func framesFor(vid uuid.UUID, segID uuid.UUID, ts []float64) []video_frame.Video
 		out = append(out, video_frame.VideoFrame{
 			ID: uuid.New(), VideoID: vid, SegmentID: segID, FrameIndex: i,
 			TimestampSeconds: t, StorageKey: "k", Width: 64, Height: 64,
+			Purpose: video_frame.PurposeBoth,
 		})
 	}
 	return out
@@ -106,8 +107,13 @@ func (s *stubExtractor) ExtractAdditional(_ context.Context, v *video.Video, _ [
 	return framesFor(v.ID, seg, timestamps), nil
 }
 
-func (s *stubExtractor) GetByVideoID(_ context.Context, _ uuid.UUID) ([]video_frame.VideoFrame, error) {
-	return s.existing, nil
+func (s *stubExtractor) GetByVideoIDSet(_ context.Context, _ uuid.UUID, set video_frame.Set) ([]video_frame.VideoFrame, error) {
+	// The resume check queries the semantic set; the stub's existing frames
+	// represent that set.
+	if set == video_frame.SetSemantic || set == "" {
+		return s.existing, nil
+	}
+	return nil, nil
 }
 
 // stubDetector returns canned planning detections and records calls.

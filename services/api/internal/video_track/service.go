@@ -216,7 +216,11 @@ func (s *Service) GenerateForVideoID(ctx context.Context, videoID uuid.UUID) ([]
 	if s.frameRepo == nil || s.detectionRepo == nil {
 		return nil, fmt.Errorf("tracking deps not configured")
 	}
-	frames, err := s.frameRepo.GetByVideoID(ctx, videoID)
+	// Tracking reads the full perception timeline: every frame of the
+	// perception set (regular fixed-rate cadence) plus the production
+	// detections attached to those frames. Semantic-only rows are not
+	// tracked.
+	frames, err := s.frameRepo.GetByVideoIDSet(ctx, videoID, video_frame.SetPerception)
 	if err != nil {
 		return nil, err
 	}
