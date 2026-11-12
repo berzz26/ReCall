@@ -43,6 +43,17 @@ type Service struct {
 	detectorName    string
 	detectorVersion string
 	batchSize       int
+	// sessionProvider optionally supplies persistent detector sessions
+	// (e.g. a prewarmed standby from detector.Manager) instead of spawning a
+	// fresh subprocess for every NewDetectionSession call.
+	sessionProvider func(ctx context.Context) (*detector.Session, error)
+}
+
+// WithSessionProvider installs a detector session provider. Nil provider (or
+// a provider error) falls back to spawning a fresh session.
+func (s *Service) WithSessionProvider(p func(ctx context.Context) (*detector.Session, error)) *Service {
+	s.sessionProvider = p
+	return s
 }
 
 func NewService(detRepo *detection.Repository, frameRepo *video_frame.Repository, store storage.Storage, analyzer detector.VisualAnalyzer, threshold float64, name, version string) *Service {
@@ -261,6 +272,9 @@ func (s *Service) AnalyzeVideo(ctx context.Context, videoID uuid.UUID) ([]detect
 
 func (s *Service) NewDetectionSession(ctx context.Context) (*detector.Session, error) {
 	if yolo, ok := s.analyzer.(*detector.YoloDetector); ok {
+		if s.sessionProvider != nil {
+			return s.sessionProvider(ctx)
+		}
 		return yolo.NewSession(ctx)
 	}
 	return nil, fmt.Errorf("analyzer is not YoloDetector")
@@ -318,6 +332,19 @@ func (s *Service) AnalyzeSegmentWithSession(ctx context.Context, videoID, segmen
 // analyzeFramesWithSessionInternal exactly so planning judgments match what
 // production YOLO will report for the same frames.
 func (s *Service) DetectFrames(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame) ([]tracker.DetectionInput, error) {
+	return s.detectFrames(ctx, videoID, frames, nil)
+}
+
+// DetectFramesWithSession runs the same planning-only detection but reuses a
+// caller-owned persistent detector session instead of spawning a fresh one.
+// The pipeline pins one session per video so coarse planning, every
+// refinement round and the final detection share a single YOLO load. A nil
+// session falls back to the per-call session behavior of DetectFrames.
+func (s *Service) DetectFramesWithSession(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame, sess *detector.Session) ([]tracker.DetectionInput, error) {
+	return s.detectFrames(ctx, videoID, frames, sess)
+}
+
+func (s *Service) detectFrames(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame, pinned *detector.Session) ([]tracker.DetectionInput, error) {
 	detectStart := time.Now()
 	if len(frames) == 0 {
 		return []tracker.DetectionInput{}, nil
@@ -332,7 +359,12 @@ func (s *Service) DetectFrames(ctx context.Context, videoID uuid.UUID, frames []
 
 	var sess *detector.Session
 	var useSession bool
-	if yolo, ok := s.analyzer.(*detector.YoloDetector); ok {
+	if pinned != nil {
+		// Reuse the pipeline-provided session; ownership (closing) stays
+		// with the caller.
+		sess = pinned
+		useSession = true
+	} else if yolo, ok := s.analyzer.(*detector.YoloDetector); ok {
 		var err error
 		sess, err = yolo.NewSession(ctx)
 		if err != nil {

@@ -96,7 +96,14 @@ func main() {
 		}
 	}
 	yolo := detector.NewYoloDetector(cfg.PythonPath, scriptPath, cfg.ModelPath, cfg.DetectionThreshold)
-	visualService := visual.NewServiceWithBatchSize(detectionRepo, videoFrameRepo, store, yolo, cfg.DetectionThreshold, cfg.DetectorName, cfg.DetectorVersion, cfg.YOLOBatchSize)
+	// Prewarm: one persistent YOLO session loaded once and handed to each
+	// video (background, non-blocking). DETECTOR_PREWARM=false keeps the
+	// per-video spawn behavior.
+	detectorManager := detector.NewManager(yolo, cfg.DetectorPrewarm)
+	detectorManager.Warmup()
+	defer detectorManager.Close()
+	visualService := visual.NewServiceWithBatchSize(detectionRepo, videoFrameRepo, store, yolo, cfg.DetectionThreshold, cfg.DetectorName, cfg.DetectorVersion, cfg.YOLOBatchSize).
+		WithSessionProvider(detectorManager.Acquire)
 
 	trackRepo := video_track.NewRepository(db.DB)
 	selectedTracker, err := tracker.New(cfg.TrackerType, cfg.TrackerHighThreshold, cfg.TrackerLowThreshold, cfg.TrackerMatchThreshold, cfg.TrackerTrackBuffer, cfg.TrackerFuseScore, cfg.TrackerMinHits, tracker.SparseParams{
@@ -175,22 +182,47 @@ func main() {
 	}
 
 	// Embedding setup (B3: persistent worker keeps model resident across
-	// ingest + search queries instead of reloading per call). The default
-	// backend is a local ONNX artifact: no PyTorch import and no Hugging Face
-	// network access, so cold start stays in the low seconds.
+	// ingest + search queries instead of reloading per call). The "native"
+	// backend runs the local ONNX artifact in-process via the C library
+	// (no Python subprocess): cold start is sub-second. The "onnx" backend
+	// spawns the Python worker, "torch" keeps the legacy path.
 	embedRepo := segment_embedding.NewRepository(db.DB)
-	embedder := embedding.NewBGEEmbedder(embedding.Options{
-		PythonPath:  cfg.EmbeddingPythonPath,
-		ScriptPath:  "workers/embedding/embed.py",
-		ModelName:   cfg.EmbeddingModel,
-		Backend:     cfg.EmbeddingBackend,
-		ONNXDir:     cfg.EmbeddingONNXDir,
-		ONNXThreads: cfg.EmbeddingONNXThreads,
-		BatchSize:   cfg.EmbeddingBatchSize,
-		Timeout:     cfg.EmbeddingTimeout,
-	})
-	embedder.StartPersistent(context.Background())
-	defer embedder.Close()
+	var embedder embedding.TextEmbedder
+	if cfg.EmbeddingBackend == embedding.NativeBackend {
+		native := embedding.NewNativeEmbedder(embedding.NativeOptions{
+			ONNXDir:     cfg.EmbeddingONNXDir,
+			RuntimePath: cfg.ONNXRuntimeLibPath,
+			ONNXThreads: cfg.EmbeddingONNXThreads,
+			BatchSize:   cfg.EmbeddingBatchSize,
+		})
+		if err := native.Load(); err != nil {
+			slog.Warn("embedding: native backend unavailable, falling back to python worker", "error", err)
+		} else {
+			defer native.Close()
+			embedder = native
+			slog.Info("embedding provider selected",
+				"model", cfg.EmbeddingModel,
+				"version", cfg.EmbeddingModelVersion,
+				"backend", cfg.EmbeddingBackend,
+				"onnx_dir", cfg.EmbeddingONNXDir,
+			)
+		}
+	}
+	if embedder == nil {
+		bge := embedding.NewBGEEmbedder(embedding.Options{
+			PythonPath:  cfg.EmbeddingPythonPath,
+			ScriptPath:  "workers/embedding/embed.py",
+			ModelName:   cfg.EmbeddingModel,
+			Backend:     cfg.EmbeddingBackend,
+			ONNXDir:     cfg.EmbeddingONNXDir,
+			ONNXThreads: cfg.EmbeddingONNXThreads,
+			BatchSize:   cfg.EmbeddingBatchSize,
+			Timeout:     cfg.EmbeddingTimeout,
+		})
+		bge.StartPersistent(context.Background())
+		defer bge.Close()
+		embedder = bge
+	}
 	embedService := segment_embedding.NewService(embedRepo, segmentDescRepo, embedder, cfg.EmbeddingModel, cfg.EmbeddingModelVersion)
 	if cfg.EnableVideoDescription {
 		slog.Info("embedding provider selected",
@@ -275,25 +307,47 @@ func main() {
 	searchHandler := handlers.NewSearchHandler(embedder, embedRepo)
 	searchService := search.NewService(embedder, embedRepo, db.DB, videoRepo, cfg.SearchCandidateLimit, cfg.SearchDefaultLimit, cfg.SearchMaxLimit, cfg.SearchMinSimilarity)
 	if cfg.RerankerEnabled {
-		reranker := rerank.NewCrossEncoderReranker(rerank.Options{
-			PythonPath:   cfg.RerankerPythonPath,
-			ScriptPath:   "workers/rerank/rerank.py",
-			ModelName:    cfg.RerankerModel,
-			Backend:      cfg.RerankerBackend,
-			Quantization: cfg.RerankerQuantization,
-			ONNXDir:      cfg.RerankerONNXDir,
-			ONNXThreads:  cfg.RerankerONNXThreads,
-			BatchSize:    cfg.RerankerBatchSize,
-			Timeout:      cfg.RerankerTimeout,
-		})
-		reranker.StartPersistent(context.Background())
-		defer reranker.Close()
-		searchService.WithReranker(reranker)
-		slog.Info("reranker enabled",
-			"model", cfg.RerankerModel, "version", cfg.RerankerModelVersion,
-			"backend", cfg.RerankerBackend, "quantization", cfg.RerankerQuantization,
-			"onnx_dir", cfg.RerankerONNXDir, "batch_size", cfg.RerankerBatchSize,
-			"candidate_limit", cfg.SearchCandidateLimit)
+		if cfg.RerankerBackend == rerank.NativeBackend {
+			native := rerank.NewNativeReranker(rerank.NativeOptions{
+				ModelName:    cfg.RerankerModel,
+				Quantization: cfg.RerankerQuantization,
+				ONNXDir:      cfg.RerankerONNXDir,
+				RuntimePath:  cfg.ONNXRuntimeLibPath,
+				ONNXThreads:  cfg.RerankerONNXThreads,
+				BatchSize:    cfg.RerankerBatchSize,
+			})
+			if err := native.Load(); err != nil {
+				slog.Warn("rerank: native backend unavailable; searches keep vector order", "error", err)
+			} else {
+				defer native.Close()
+				searchService.WithReranker(native)
+				slog.Info("reranker enabled",
+					"model", cfg.RerankerModel, "version", cfg.RerankerModelVersion,
+					"backend", cfg.RerankerBackend, "quantization", cfg.RerankerQuantization,
+					"onnx_dir", cfg.RerankerONNXDir, "batch_size", cfg.RerankerBatchSize,
+					"candidate_limit", cfg.SearchCandidateLimit)
+			}
+		} else {
+			reranker := rerank.NewCrossEncoderReranker(rerank.Options{
+				PythonPath:   cfg.RerankerPythonPath,
+				ScriptPath:   "workers/rerank/rerank.py",
+				ModelName:    cfg.RerankerModel,
+				Backend:      cfg.RerankerBackend,
+				Quantization: cfg.RerankerQuantization,
+				ONNXDir:      cfg.RerankerONNXDir,
+				ONNXThreads:  cfg.RerankerONNXThreads,
+				BatchSize:    cfg.RerankerBatchSize,
+				Timeout:      cfg.RerankerTimeout,
+			})
+			reranker.StartPersistent(context.Background())
+			defer reranker.Close()
+			searchService.WithReranker(reranker)
+			slog.Info("reranker enabled",
+				"model", cfg.RerankerModel, "version", cfg.RerankerModelVersion,
+				"backend", cfg.RerankerBackend, "quantization", cfg.RerankerQuantization,
+				"onnx_dir", cfg.RerankerONNXDir, "batch_size", cfg.RerankerBatchSize,
+				"candidate_limit", cfg.SearchCandidateLimit)
+		}
 	} else {
 		slog.Info("reranker disabled via RERANKER_ENABLED=false; vector order preserved")
 	}

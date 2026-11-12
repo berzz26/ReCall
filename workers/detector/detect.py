@@ -95,7 +95,7 @@ def _inference_batch(model, frames, threshold):
 
     batch_start = time.time()
     try:
-        preds = model(paths, verbose=False)
+        preds = model(source=paths, conf=threshold, verbose=False)
         if not isinstance(preds, list):
             preds = [preds]
     except Exception as e:

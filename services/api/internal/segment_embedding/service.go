@@ -60,7 +60,9 @@ func (s *Service) GenerateForVideo(ctx context.Context, videoID uuid.UUID) ([]Em
 
 	// Use embedder batch via type assertion for WithIDs if available
 	var embeddings map[string][]float32
-	if be, ok := s.embedder.(*embedding.BGEEmbedder); ok {
+	if be, ok := s.embedder.(interface {
+		EmbedPassagesWithIDs(ctx context.Context, ids []string, texts []string) (map[string][]float32, error)
+	}); ok {
 		embeddings, err = be.EmbedPassagesWithIDs(ctx, ids, texts)
 	} else {
 		// fallback: embed sequentially? but spec requires batch; use EmbedPassages and map by order

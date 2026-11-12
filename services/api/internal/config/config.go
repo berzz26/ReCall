@@ -52,6 +52,7 @@ type Config struct {
 	FrameJPEGQuality       int
 	DetectionThreshold     float64
 	DetectorName           string
+	DetectorPrewarm        bool
 	DetectorVersion        string
 	ModelPath              string
 	PythonPath             string
@@ -77,6 +78,7 @@ type Config struct {
 	EmbeddingONNXThreads   int
 	EmbeddingBatchSize     int
 	EmbeddingTimeout       time.Duration
+	ONNXRuntimeLibPath     string
 	SearchCandidateLimit   int
 	SearchDefaultLimit     int
 	SearchMaxLimit         int
@@ -429,6 +431,20 @@ func Load() Config {
 	if pythonPath == "" {
 		pythonPath = "python3"
 	}
+	// DETECTOR_PREWARM=true pre-loads YOLO once at API startup and keeps a
+	// standby session resident (handed to each video). Costs ~1 resident
+	// detector process; eliminates the Python/ultralytics cold start per video.
+	detectorPrewarm := false
+	if v := os.Getenv("DETECTOR_PREWARM"); v != "" {
+		switch v2 := strings.ToLower(strings.TrimSpace(v)); v2 {
+		case "1", "true", "yes", "y", "on", "enable", "enabled":
+			detectorPrewarm = true
+		case "0", "false", "no", "n", "off", "disable", "disabled":
+			detectorPrewarm = false
+		default:
+			panic(fmt.Sprintf("invalid DETECTOR_PREWARM %q: must be boolean (true/false, 1/0, yes/no, on/off)", v))
+		}
+	}
 
 	// Fix redundancy: MODEL_PATH and DETECTOR_NAME were duplicated.
 	// Now DETECTOR_NAME is the single source of truth; MODEL_PATH is derived if not set.
@@ -616,9 +632,16 @@ func Load() Config {
 	if embeddingBackend == "" {
 		embeddingBackend = "onnx"
 	}
-	if embeddingBackend != "onnx" && embeddingBackend != "torch" {
-		panic(fmt.Sprintf("invalid EMBEDDING_BACKEND %q: must be onnx or torch", embeddingBackend))
+	switch embeddingBackend {
+	case "native", "onnx", "torch":
+	default:
+		panic(fmt.Sprintf("invalid EMBEDDING_BACKEND %q: must be native, onnx or torch", embeddingBackend))
 	}
+	onnxRuntimeLibPath := strings.TrimSpace(os.Getenv("ONNXRUNTIME_LIB_PATH"))
+	if onnxRuntimeLibPath == "" {
+		onnxRuntimeLibPath = "third_party/onnxruntime/onnxruntime-linux-x64-1.31.1/lib/libonnxruntime.so"
+	}
+
 	embeddingONNXDir := strings.TrimSpace(os.Getenv("EMBEDDING_ONNX_DIR"))
 	if embeddingONNXDir == "" {
 		embeddingONNXDir = "workers/embedding/models/bge-small-en-v1.5"
@@ -714,9 +737,9 @@ func Load() Config {
 		rerankerBackend = "torch"
 	}
 	switch rerankerBackend {
-	case "torch", "onnx":
+	case "torch", "onnx", "native":
 	default:
-		panic(fmt.Sprintf("invalid RERANKER_BACKEND %q: must be one of [torch, onnx]", rerankerBackend))
+		panic(fmt.Sprintf("invalid RERANKER_BACKEND %q: must be one of [torch, onnx, native]", rerankerBackend))
 	}
 	rerankerQuantization := strings.ToLower(strings.TrimSpace(os.Getenv("RERANKER_QUANTIZATION")))
 	if rerankerQuantization == "" {
@@ -727,8 +750,8 @@ func Load() Config {
 	default:
 		panic(fmt.Sprintf("invalid RERANKER_QUANTIZATION %q: must be one of [none, int8]", rerankerQuantization))
 	}
-	if rerankerBackend != "onnx" && rerankerQuantization == "int8" {
-		panic("RERANKER_QUANTIZATION=int8 requires RERANKER_BACKEND=onnx")
+	if rerankerBackend != "onnx" && rerankerBackend != "native" && rerankerQuantization == "int8" {
+		panic("RERANKER_QUANTIZATION=int8 requires RERANKER_BACKEND=onnx or native")
 	}
 	rerankerONNXDir := os.Getenv("RERANKER_ONNX_DIR")
 	if rerankerONNXDir == "" {
@@ -931,6 +954,7 @@ func Load() Config {
 		FrameJPEGQuality:         frameJPEGQuality,
 		DetectionThreshold:       detectionThreshold,
 		DetectorName:             detectorName,
+		DetectorPrewarm:          detectorPrewarm,
 		DetectorVersion:          detectorVersion,
 		ModelPath:                modelPath,
 		PythonPath:               pythonPath,
@@ -956,6 +980,7 @@ func Load() Config {
 		EmbeddingONNXThreads:     embeddingONNXThreads,
 		EmbeddingBatchSize:       embeddingBatchSize,
 		EmbeddingTimeout:         embeddingTimeout,
+		ONNXRuntimeLibPath:       onnxRuntimeLibPath,
 		SearchCandidateLimit:     searchCandidateLimit,
 		SearchDefaultLimit:       searchDefaultLimit,
 		SearchMaxLimit:           searchMaxLimit,

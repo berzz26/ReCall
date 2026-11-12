@@ -45,6 +45,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/detector"
 	"github.com/berzz26/recall/services/api/internal/sampler"
 	"github.com/berzz26/recall/services/api/internal/tracker"
 	"github.com/berzz26/recall/services/api/internal/video"
@@ -64,6 +65,15 @@ type VideoFrameExtractor interface {
 // *visual.Service satisfies it; planning detections are never persisted.
 type PlanningDetector interface {
 	DetectFrames(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame) ([]tracker.DetectionInput, error)
+}
+
+// SessionAwarePlanningDetector is an optional extension of PlanningDetector:
+// it lets the pipeline pin one persistent detector session per video so
+// coarse planning, every refinement round and the final checkpointed
+// detection share a single YOLO model load instead of one per call.
+// *visual.Service satisfies it.
+type SessionAwarePlanningDetector interface {
+	DetectFramesWithSession(ctx context.Context, videoID uuid.UUID, frames []video_frame.VideoFrame, sess *detector.Session) ([]tracker.DetectionInput, error)
 }
 
 // AdaptiveSamplerConfig wires the orchestrator. All sampler tuning lives in
@@ -167,7 +177,15 @@ func (a *AdaptiveSampler) baselinePlan(videoID uuid.UUID, duration float64) (sam
 // stages read frames/detections from storage as usual; the plan object
 // itself is observability, not a downstream input.
 // allowResume mirrors the legacy checkpoint skip-if-exists semantics.
-func (a *AdaptiveSampler) PlanAndExtract(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, duration float64, w, h int, videoPath string, allowResume bool) (plan *sampler.SamplingPlan, stats *AdaptiveStats, err error) {
+// detectSession optionally pins a caller-owned persistent detector session
+// (variadic so existing callers and tests compile unchanged): when provided,
+// coarse planning and every refinement round reuse it instead of each paying
+// a full Python/ultralytics cold start. Ownership stays with the caller.
+func (a *AdaptiveSampler) PlanAndExtract(ctx context.Context, v *video.Video, segments []video_segment.VideoSegment, duration float64, w, h int, videoPath string, allowResume bool, detectSession ...*detector.Session) (plan *sampler.SamplingPlan, stats *AdaptiveStats, err error) {
+	var pinnedSess *detector.Session
+	if len(detectSession) > 0 {
+		pinnedSess = detectSession[0]
+	}
 	stats = &AdaptiveStats{VideoID: v.ID.String(), DurationSeconds: duration, Version: sampler.SamplerVersion, Shadow: a.cfg.Shadow}
 	start := time.Now()
 	defer func() { stats.TotalMs = time.Since(start).Milliseconds() }()
@@ -217,7 +235,7 @@ func (a *AdaptiveSampler) PlanAndExtract(ctx context.Context, v *video.Video, se
 	planCtx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
 	defer cancel()
 
-	p, st, err := a.adaptiveInner(planCtx, ctx, v, segments, duration, w, h, videoPath)
+	p, st, err := a.adaptiveInner(planCtx, ctx, v, segments, duration, w, h, videoPath, pinnedSess)
 	*stats = *st
 	stats.VideoID = v.ID.String()
 	stats.DurationSeconds = duration
@@ -229,7 +247,7 @@ func (a *AdaptiveSampler) PlanAndExtract(ctx context.Context, v *video.Video, se
 // adaptiveInner is the timeout-bounded adaptive flow (panic boundary above).
 // parentCtx distinguishes our deadline expiry (baseline fallback) from real
 // caller cancellation (propagate).
-func (a *AdaptiveSampler) adaptiveInner(planCtx, parentCtx context.Context, v *video.Video, segments []video_segment.VideoSegment, duration float64, w, h int, videoPath string) (*sampler.SamplingPlan, *AdaptiveStats, error) {
+func (a *AdaptiveSampler) adaptiveInner(planCtx, parentCtx context.Context, v *video.Video, segments []video_segment.VideoSegment, duration float64, w, h int, videoPath string, pinnedSess *detector.Session) (*sampler.SamplingPlan, *AdaptiveStats, error) {
 	stats := &AdaptiveStats{}
 	cancelled := func() bool { return parentCtx.Err() != nil }
 
@@ -328,7 +346,7 @@ func (a *AdaptiveSampler) adaptiveInner(planCtx, parentCtx context.Context, v *v
 
 	// 6. Ephemeral planning YOLO on coarse frames only.
 	yoloStart := time.Now()
-	coarseDets, err := a.visual.DetectFrames(planCtx, v.ID, coarseFrames)
+	coarseDets, err := a.planningDetect(planCtx, v, coarseFrames, pinnedSess)
 	stats.PlanningYoloMs = time.Since(yoloStart).Milliseconds()
 	if err != nil {
 		if cancelled() {
@@ -355,7 +373,7 @@ func (a *AdaptiveSampler) adaptiveInner(planCtx, parentCtx context.Context, v *v
 		if err != nil {
 			return nil, err
 		}
-		md, err := a.visual.DetectFrames(rctx, v.ID, newFrames)
+		md, err := a.planningDetect(rctx, v, newFrames, pinnedSess)
 		if err != nil {
 			return nil, err
 		}
@@ -420,6 +438,16 @@ func (a *AdaptiveSampler) finishWithPlan(planCtx, parentCtx context.Context, v *
 	a.logDecision(v, stats)
 	out := plan
 	return &out, stats, nil
+}
+
+// planningDetect runs ephemeral planning detection, preferring a
+// pipeline-provided persistent detector session when the detector supports
+// it (one YOLO cold start per video instead of one per call).
+func (a *AdaptiveSampler) planningDetect(ctx context.Context, v *video.Video, frames []video_frame.VideoFrame, sess *detector.Session) ([]tracker.DetectionInput, error) {
+	if sasd, ok := a.visual.(SessionAwarePlanningDetector); ok {
+		return sasd.DetectFramesWithSession(ctx, v.ID, frames, sess)
+	}
+	return a.visual.DetectFrames(ctx, v.ID, frames)
 }
 
 // fallbackToBaseline discards all adaptive state and re-extracts the

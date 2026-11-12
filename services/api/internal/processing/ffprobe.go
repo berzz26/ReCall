@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/berzz26/recall/services/api/internal/detector"
 	"github.com/berzz26/recall/services/api/internal/segment_description"
 	"github.com/berzz26/recall/services/api/internal/segment_embedding"
 	"github.com/berzz26/recall/services/api/internal/storage"
@@ -425,6 +426,26 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 		return fmt.Errorf("frame extraction requires segments")
 	}
 
+	// One persistent detector session per video: it serves coarse planning,
+	// every adaptive refinement round and the final checkpointed detection,
+	// so YOLO loads exactly once per video instead of once per detection
+	// call. Creation is best-effort — when it fails the per-stage fallback
+	// paths keep working.
+	var yoloSess *detector.Session
+	if p.visualService != nil {
+		if s, sessErr := p.visualService.NewDetectionSession(ctx); sessErr == nil {
+			yoloSess = s
+			defer func() {
+				if cerr := yoloSess.Close(); cerr != nil {
+					slog.Warn("pipeline: failed to close YOLO session", "video_id", v.ID.String(), "error", cerr)
+				}
+			}()
+			slog.Info("pipeline: YOLO persistent session created for video", "video_id", v.ID.String())
+		} else {
+			slog.Warn("pipeline: YOLO session unavailable for video; falling back per stage", "video_id", v.ID.String(), "error", sessErr)
+		}
+	}
+
 	if p.frameService != nil {
 		if meta.DurationSeconds == nil || *meta.DurationSeconds <= 0 {
 			return fmt.Errorf("video duration unavailable; cannot extract frames")
@@ -446,7 +467,7 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 			// validated plan → extraction, with baseline fallbacks. The
 			// orchestrator owns resume-skip semantics for this path.
 			frameStart := time.Now()
-			_, stats, err := p.adaptiveSampler.PlanAndExtract(ctx, v, segments, *meta.DurationSeconds, w, h, videoPath, p.checkpointRepo != nil)
+			_, stats, err := p.adaptiveSampler.PlanAndExtract(ctx, v, segments, *meta.DurationSeconds, w, h, videoPath, p.checkpointRepo != nil, yoloSess)
 			frameMs = time.Since(frameStart).Milliseconds()
 			if err != nil {
 				slog.Error("pipeline: adaptive sampling failed", "video_id", v.ID.String(), "duration_ms", frameMs, "error", err)
@@ -489,12 +510,19 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 
 	if p.visualService != nil {
 		if p.checkpointRepo != nil {
-			// Segment-level checkpointed detection: one YOLO session per video, bounded batches per segment
+			// Segment-level checkpointed detection: reuse the per-video YOLO
+			// session created before frame planning when available; only fall
+			// back to creating a fresh session (and then to per-segment
+			// sessions) when the video-wide one failed to start.
 			visualStart := time.Now()
 			slog.Info("pipeline: detection start (checkpointed)", "video_id", v.ID.String(), "segments", len(segments))
-			sessObj, sessErr := p.visualService.NewDetectionSession(ctx)
+			sessObj := yoloSess
 			var useSess bool
-			if sessErr == nil && sessObj != nil {
+			if sessObj != nil {
+				useSess = true
+				slog.Info("pipeline: reusing per-video YOLO session for checkpointed detection", "video_id", v.ID.String())
+			} else if s, sessErr := p.visualService.NewDetectionSession(ctx); sessErr == nil && s != nil {
+				sessObj = s
 				useSess = true
 				defer func() {
 					if cerr := sessObj.Close(); cerr != nil {
@@ -503,7 +531,11 @@ func (p *FFprobeProcessor) Process(ctx context.Context, v *video.Video) error {
 				}()
 				slog.Info("pipeline: YOLO session created for checkpointed detection", "video_id", v.ID.String())
 			} else {
-				slog.Info("pipeline: YOLO session not available, using per-batch detection", "video_id", v.ID.String(), "reason", sessErr)
+				var reason error
+				if sessErr != nil {
+					reason = sessErr
+				}
+				slog.Info("pipeline: YOLO session not available, using per-batch detection", "video_id", v.ID.String(), "reason", reason)
 			}
 			// Iterate segments in deterministic segment_index order
 			for _, seg := range segments {

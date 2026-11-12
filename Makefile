@@ -21,7 +21,7 @@ EMBEDDING_ONNX_DIR ?= $(call rerank_env,EMBEDDING_ONNX_DIR)
 export RERANKER_ENABLED RERANKER_BACKEND RERANKER_QUANTIZATION RERANKER_MODEL RERANKER_ONNX_DIR RERANKER_PYTHON_PATH
 export EMBEDDING_BACKEND EMBEDDING_PYTHON_PATH EMBEDDING_MODEL EMBEDDING_MODEL_REVISION EMBEDDING_ONNX_DIR
 
-.PHONY: run prepare-rerank prepare-embedding build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install
+.PHONY: run prepare-rerank prepare-embedding build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install fetch-onnxruntime
 
 # Prepares the ONNX rerank artifact backend=onnx targets require. Runs before
 # every `make run`; prepare_onnx.py --ensure skips in milliseconds when a valid
@@ -31,8 +31,8 @@ export EMBEDDING_BACKEND EMBEDDING_PYTHON_PATH EMBEDDING_MODEL EMBEDDING_MODEL_R
 prepare-rerank:
 	@if [ "$(RERANKER_ENABLED)" != "true" ]; then \
 	  echo "prepare-rerank: RERANKER_ENABLED is not true, skipping"; \
-	elif [ "$(RERANKER_BACKEND)" != "onnx" ]; then \
-	  echo "prepare-rerank: RERANKER_BACKEND is not onnx, skipping"; \
+	elif [ "$(RERANKER_BACKEND)" != "onnx" ] && [ "$(RERANKER_BACKEND)" != "native" ]; then \
+	  echo "prepare-rerank: RERANKER_BACKEND is neither onnx nor native, skipping"; \
 	else \
 	  py="$(RERANKER_PYTHON_PATH)"; \
 	  [ -n "$$py" ] || py="python3"; \
@@ -42,7 +42,7 @@ prepare-rerank:
 
 prepare-embedding:
 	@backend="$(EMBEDDING_BACKEND)"; backend=$${backend:-onnx}; \
-	if [ "$$backend" != "onnx" ]; then \
+	if [ "$$backend" != "onnx" ] && [ "$$backend" != "native" ]; then \
 	  echo "prepare-embedding: EMBEDDING_BACKEND=$$backend, skipping ONNX artifact"; \
 	else \
 	  py="$(EMBEDDING_PYTHON_PATH)"; [ -n "$$py" ] || py="python3"; \
@@ -50,14 +50,26 @@ prepare-embedding:
 	  exec "$$py" workers/embedding/prepare_onnx.py --ensure; \
 	fi
 
-run: prepare-rerank prepare-embedding
-	go run ./services/api/cmd/server
+# `run` builds a real binary instead of using `go run`: `go run` recompiles
+# and re-links the whole API on every invocation (tens of seconds on a cold
+# toolchain), while `go build` reuses the build cache incrementally and the
+# binary starts instantly afterwards.
+run: prepare-rerank prepare-embedding fetch-onnxruntime
+	go build -o bin/api ./services/api/cmd/server
+	./bin/api
 
 run-web:
 	cd services/web && npm run dev
 
-build:
+build: fetch-onnxruntime
 	go build -o bin/api ./services/api/cmd/server
+
+# Downloads the pinned ONNX Runtime distribution the native (in-process)
+# embedding/rerank backends link against. Idempotent: exits immediately when
+# the library is already present, so `make run` stays a no-op fast path
+# locally. third_party/ is gitignored; fresh clones fetch it from here.
+fetch-onnxruntime:
+	./scripts/fetch-onnxruntime.sh
 
 tidy:
 	go mod tidy
