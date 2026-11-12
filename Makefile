@@ -12,9 +12,16 @@ RERANKER_MODEL ?= $(call rerank_env,RERANKER_MODEL)
 RERANKER_ONNX_DIR ?= $(call rerank_env,RERANKER_ONNX_DIR)
 RERANKER_PYTHON_PATH ?= $(call rerank_env,RERANKER_PYTHON_PATH)
 
-export RERANKER_ENABLED RERANKER_BACKEND RERANKER_QUANTIZATION RERANKER_MODEL RERANKER_ONNX_DIR RERANKER_PYTHON_PATH
+EMBEDDING_BACKEND ?= $(call rerank_env,EMBEDDING_BACKEND)
+EMBEDDING_PYTHON_PATH ?= $(call rerank_env,EMBEDDING_PYTHON_PATH)
+EMBEDDING_MODEL ?= $(call rerank_env,EMBEDDING_MODEL)
+EMBEDDING_MODEL_REVISION ?= $(call rerank_env,EMBEDDING_MODEL_REVISION)
+EMBEDDING_ONNX_DIR ?= $(call rerank_env,EMBEDDING_ONNX_DIR)
 
-.PHONY: run prepare-rerank build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install
+export RERANKER_ENABLED RERANKER_BACKEND RERANKER_QUANTIZATION RERANKER_MODEL RERANKER_ONNX_DIR RERANKER_PYTHON_PATH
+export EMBEDDING_BACKEND EMBEDDING_PYTHON_PATH EMBEDDING_MODEL EMBEDDING_MODEL_REVISION EMBEDDING_ONNX_DIR
+
+.PHONY: run prepare-rerank prepare-embedding build tidy fmt test docker-build docker-up docker-down db-up migrate-up migrate-down migrate-create migrate-install
 
 # Prepares the ONNX rerank artifact backend=onnx targets require. Runs before
 # every `make run`; prepare_onnx.py --ensure skips in milliseconds when a valid
@@ -33,7 +40,17 @@ prepare-rerank:
 	  exec "$$py" workers/rerank/prepare_onnx.py --ensure; \
 	fi
 
-run: prepare-rerank
+prepare-embedding:
+	@backend="$(EMBEDDING_BACKEND)"; backend=$${backend:-onnx}; \
+	if [ "$$backend" != "onnx" ]; then \
+	  echo "prepare-embedding: EMBEDDING_BACKEND=$$backend, skipping ONNX artifact"; \
+	else \
+	  py="$(EMBEDDING_PYTHON_PATH)"; [ -n "$$py" ] || py="python3"; \
+	  echo "prepare-embedding: ensuring embedding ONNX artifact (model=$(EMBEDDING_MODEL), dir=$(EMBEDDING_ONNX_DIR))"; \
+	  exec "$$py" workers/embedding/prepare_onnx.py --ensure; \
+	fi
+
+run: prepare-rerank prepare-embedding
 	go run ./services/api/cmd/server
 
 run-web:

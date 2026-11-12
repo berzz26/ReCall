@@ -175,14 +175,30 @@ func main() {
 	}
 
 	// Embedding setup (B3: persistent worker keeps model resident across
-	// ingest + search queries instead of reloading per call).
+	// ingest + search queries instead of reloading per call). The default
+	// backend is a local ONNX artifact: no PyTorch import and no Hugging Face
+	// network access, so cold start stays in the low seconds.
 	embedRepo := segment_embedding.NewRepository(db.DB)
-	embedder := embedding.NewBGEEmbedder(cfg.EmbeddingPythonPath, "workers/embedding/embed.py", cfg.EmbeddingTimeout)
+	embedder := embedding.NewBGEEmbedder(embedding.Options{
+		PythonPath:  cfg.EmbeddingPythonPath,
+		ScriptPath:  "workers/embedding/embed.py",
+		ModelName:   cfg.EmbeddingModel,
+		Backend:     cfg.EmbeddingBackend,
+		ONNXDir:     cfg.EmbeddingONNXDir,
+		ONNXThreads: cfg.EmbeddingONNXThreads,
+		BatchSize:   cfg.EmbeddingBatchSize,
+		Timeout:     cfg.EmbeddingTimeout,
+	})
 	embedder.StartPersistent(context.Background())
 	defer embedder.Close()
 	embedService := segment_embedding.NewService(embedRepo, segmentDescRepo, embedder, cfg.EmbeddingModel, cfg.EmbeddingModelVersion)
 	if cfg.EnableVideoDescription {
-		slog.Info("embedding provider selected", "model", cfg.EmbeddingModel, "version", cfg.EmbeddingModelVersion)
+		slog.Info("embedding provider selected",
+			"model", cfg.EmbeddingModel,
+			"version", cfg.EmbeddingModelVersion,
+			"backend", cfg.EmbeddingBackend,
+			"onnx_dir", cfg.EmbeddingONNXDir,
+		)
 	} else {
 		slog.Info("embedding generation will be skipped when descriptions disabled")
 	}

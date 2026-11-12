@@ -72,6 +72,10 @@ type Config struct {
 	EmbeddingPythonPath    string
 	EmbeddingModel         string
 	EmbeddingModelVersion  string
+	EmbeddingBackend       string
+	EmbeddingONNXDir       string
+	EmbeddingONNXThreads   int
+	EmbeddingBatchSize     int
 	EmbeddingTimeout       time.Duration
 	SearchCandidateLimit   int
 	SearchDefaultLimit     int
@@ -608,6 +612,33 @@ func Load() Config {
 	if embeddingModelVersion == "" {
 		embeddingModelVersion = "v1.5"
 	}
+	embeddingBackend := strings.ToLower(strings.TrimSpace(os.Getenv("EMBEDDING_BACKEND")))
+	if embeddingBackend == "" {
+		embeddingBackend = "onnx"
+	}
+	if embeddingBackend != "onnx" && embeddingBackend != "torch" {
+		panic(fmt.Sprintf("invalid EMBEDDING_BACKEND %q: must be onnx or torch", embeddingBackend))
+	}
+	embeddingONNXDir := strings.TrimSpace(os.Getenv("EMBEDDING_ONNX_DIR"))
+	if embeddingONNXDir == "" {
+		embeddingONNXDir = "workers/embedding/models/bge-small-en-v1.5"
+	}
+	embeddingONNXThreads := 4
+	if v := os.Getenv("EMBEDDING_ONNX_THREADS"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 {
+			panic(fmt.Sprintf("invalid EMBEDDING_ONNX_THREADS %q: must be >= 1", v))
+		}
+		embeddingONNXThreads = parsed
+	}
+	embeddingBatchSize := 32
+	if v := os.Getenv("EMBEDDING_BATCH_SIZE"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 {
+			panic(fmt.Sprintf("invalid EMBEDDING_BATCH_SIZE %q: must be >= 1", v))
+		}
+		embeddingBatchSize = parsed
+	}
 	embeddingTimeout := 5 * time.Minute
 	if v := os.Getenv("EMBEDDING_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -920,6 +951,10 @@ func Load() Config {
 		EmbeddingPythonPath:      embeddingPythonPath,
 		EmbeddingModel:           embeddingModel,
 		EmbeddingModelVersion:    embeddingModelVersion,
+		EmbeddingBackend:         embeddingBackend,
+		EmbeddingONNXDir:         embeddingONNXDir,
+		EmbeddingONNXThreads:     embeddingONNXThreads,
+		EmbeddingBatchSize:       embeddingBatchSize,
 		EmbeddingTimeout:         embeddingTimeout,
 		SearchCandidateLimit:     searchCandidateLimit,
 		SearchDefaultLimit:       searchDefaultLimit,

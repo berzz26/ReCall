@@ -168,9 +168,32 @@ when `ENABLE_VIDEO_DESCRIPTION=true`.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `EMBEDDING_PYTHON_PATH` | `python3` | Interpreter for `workers/embedding/embed.py`. |
-| `EMBEDDING_MODEL` / `EMBEDDING_MODEL_VERSION` | `BAAI/bge-small-en-v1.5` / `v1.5` | Sentence-transformer id + version tag. |
+| `EMBEDDING_BACKEND` | `onnx` | `onnx` loads a prepared local artifact through ONNX Runtime (no PyTorch import, no Hugging Face calls). `torch` keeps the legacy sentence-transformers path, which imports PyTorch and resolves the model id at startup and is much slower on cold start. |
+| `EMBEDDING_PYTHON_PATH` | `python3` | Interpreter for `workers/embedding/embed.py` and `workers/embedding/prepare_onnx.py`. |
+| `EMBEDDING_MODEL` / `EMBEDDING_MODEL_VERSION` | `BAAI/bge-small-en-v1.5` / `v1.5` | Model id (used to pin the ONNX artifact and by the `torch` backend) + version tag stored with rows. |
+| `EMBEDDING_MODEL_REVISION` | pinned `5c38ec7…` | Upstream revision the ONNX artifact is pinned to. |
+| `EMBEDDING_ONNX_DIR` | `workers/embedding/models/bge-small-en-v1.5` | Directory holding `model.onnx`, `tokenizer.json`, and `embedding_artifact.json`. |
+| `EMBEDDING_ONNX_THREADS` | `4` | ONNX Runtime intra-op CPU threads (inter-op is fixed at 1). |
+| `EMBEDDING_BATCH_SIZE` | `32` | Texts embedded per inference batch; applies to both backends. |
 | `EMBEDDING_TIMEOUT` | `5m` | Kill a hung embedding job after this long. |
+
+### ONNX embedding artifact
+
+Like the reranker, the embedding ONNX path never downloads or exports inside the
+API process or during a request. `make run` invokes
+`workers/embedding/prepare_onnx.py --ensure` as a separate process before
+starting the server. It downloads the pinned graph and tokenizer from Hugging
+Face only when they are missing (or copies them from `--source-dir`), verifies
+their SHA-256 checksums, and writes `embedding_artifact.json`. Repeat runs skip
+in well under a second.
+
+At runtime `embed.py` uses the Rust `tokenizers` library plus ONNX Runtime,
+with CLS pooling and L2 normalization — exactly matching sentence-transformers
+for `BAAI/bge-small-en-v1.5`, so vectors already stored in PostgreSQL remain
+compatible. The artifact directory is intentionally kept out of git. Install
+the ONNX backend dependencies with
+`python3 -m pip install -r workers/embedding/requirements-onnx.txt`; PyTorch is
+only needed when `EMBEDDING_BACKEND=torch`.
 
 ## 8. Search API
 

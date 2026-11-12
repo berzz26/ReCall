@@ -16,6 +16,8 @@ workers/vision/__pycache__/
 workers/vision/.venv/
 workers/rerank/__pycache__/
 workers/rerank/models/
+workers/embedding/__pycache__/
+workers/embedding/models/
 __pycache__/
 *.log
 .tmp/

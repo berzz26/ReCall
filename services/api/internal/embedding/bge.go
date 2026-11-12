@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,15 +23,41 @@ const (
 	DefaultModel        = "BAAI/bge-small-en-v1.5"
 	DefaultModelVersion = "v1.5"
 	QueryPrefix         = "Represent this sentence for searching relevant passages: "
+
+	// DefaultBackend is the local ONNX Runtime path: no PyTorch import and no
+	// Hugging Face network access at startup. "torch" keeps the legacy
+	// sentence-transformers backend for compatibility.
+	DefaultBackend      = "onnx"
+	DefaultONNXDir      = "workers/embedding/models/bge-small-en-v1.5"
+	DefaultONNXThreads  = 4
+	DefaultBatchSize    = 32
+	DefaultStartupLimit = 180 * time.Second
 )
+
+// Options configures the subprocess-backed embedding worker.
+type Options struct {
+	PythonPath  string
+	ScriptPath  string
+	ModelName   string
+	Backend     string // "onnx" or "torch"
+	ONNXDir     string
+	ONNXThreads int
+	BatchSize   int
+	Timeout     time.Duration
+}
 
 // BGEEmbedder invokes workers/embedding/embed.py.
 // It prefers a persistent subprocess (model loaded once) and falls back
 // to one-shot execution if the persistent worker is unavailable.
 type BGEEmbedder struct {
-	pythonPath string
-	scriptPath string
-	timeout    time.Duration
+	pythonPath  string
+	scriptPath  string
+	modelName   string
+	backend     string
+	onnxDir     string
+	onnxThreads int
+	batchSize   int
+	timeout     time.Duration
 
 	mu      sync.Mutex
 	sess    *persistSession
@@ -47,13 +74,36 @@ type persistSession struct {
 	done   chan error
 }
 
-func NewBGEEmbedder(pythonPath, scriptPath string, timeout time.Duration) *BGEEmbedder {
+func NewBGEEmbedder(opts Options) *BGEEmbedder {
+	pythonPath := opts.PythonPath
 	if pythonPath == "" {
 		pythonPath = "python3"
 	}
+	scriptPath := opts.ScriptPath
 	if scriptPath == "" {
 		scriptPath = "workers/embedding/embed.py"
 	}
+	modelName := opts.ModelName
+	if modelName == "" {
+		modelName = DefaultModel
+	}
+	backend := strings.ToLower(strings.TrimSpace(opts.Backend))
+	if backend == "" {
+		backend = DefaultBackend
+	}
+	onnxDir := opts.ONNXDir
+	if onnxDir == "" {
+		onnxDir = DefaultONNXDir
+	}
+	onnxThreads := opts.ONNXThreads
+	if onnxThreads <= 0 {
+		onnxThreads = DefaultONNXThreads
+	}
+	batchSize := opts.BatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
+	timeout := opts.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
@@ -75,7 +125,34 @@ func NewBGEEmbedder(pythonPath, scriptPath string, timeout time.Duration) *BGEEm
 			scriptPath = abs
 		}
 	}
-	return &BGEEmbedder{pythonPath: pythonPath, scriptPath: scriptPath, timeout: timeout}
+	return &BGEEmbedder{
+		pythonPath:  pythonPath,
+		scriptPath:  scriptPath,
+		modelName:   modelName,
+		backend:     backend,
+		onnxDir:     onnxDir,
+		onnxThreads: onnxThreads,
+		batchSize:   batchSize,
+		timeout:     timeout,
+	}
+}
+
+// workerArgs builds the Python worker command line for both persistent and
+// one-shot modes. Keeping them in one place avoids silently dropping flags
+// (backend/artifact paths) in one of the two execution paths.
+func (b *BGEEmbedder) workerArgs(persistent bool, inputPath, outputPath, mode string) []string {
+	args := []string{b.scriptPath}
+	if persistent {
+		args = append(args, "--persistent")
+	} else {
+		args = append(args, "--input", inputPath, "--output", outputPath, "--mode", mode)
+	}
+	args = append(args, "--backend", b.backend)
+	args = append(args, "--model", b.modelName)
+	args = append(args, "--onnx-dir", b.onnxDir)
+	args = append(args, "--onnx-threads", strconv.Itoa(b.onnxThreads))
+	args = append(args, "--batch-size", strconv.Itoa(b.batchSize))
+	return args
 }
 
 // StartPersistent launches the model-once worker. Best-effort: failures are
@@ -93,7 +170,7 @@ func (b *BGEEmbedder) StartPersistent(ctx context.Context) {
 		return
 	}
 	b.sess = sess
-	slog.Info("embedding: persistent worker ready", "script", b.scriptPath)
+	slog.Info("embedding: persistent worker ready", "script", b.scriptPath, "backend", b.backend, "onnx_dir", b.onnxDir)
 }
 
 // Close stops the persistent worker if running.
@@ -129,7 +206,7 @@ func (b *BGEEmbedder) launchPersistent(ctx context.Context) (*persistSession, er
 		return nil, fmt.Errorf("embedding script not found: %w", err)
 	}
 	sessCtx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(sessCtx, b.pythonPath, b.scriptPath, "--persistent")
+	cmd := exec.CommandContext(sessCtx, b.pythonPath, b.workerArgs(true, "", "", "")...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -174,7 +251,7 @@ func (b *BGEEmbedder) launchPersistent(ctx context.Context) (*persistSession, er
 		}
 		readyCh <- line
 	}()
-	timeout, cancelT := context.WithTimeout(ctx, 180*time.Second)
+	timeout, cancelT := context.WithTimeout(ctx, DefaultStartupLimit)
 	defer cancelT()
 	select {
 	case <-timeout.Done():
@@ -322,7 +399,7 @@ func (b *BGEEmbedder) embedBatch(ctx context.Context, items []embedInputItem, mo
 	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
-	cmd := exec.CommandContext(timeoutCtx, b.pythonPath, b.scriptPath, "--input", inputPath, "--output", outputPath, "--mode", mode)
+	cmd := exec.CommandContext(timeoutCtx, b.pythonPath, b.workerArgs(false, inputPath, outputPath, mode)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
